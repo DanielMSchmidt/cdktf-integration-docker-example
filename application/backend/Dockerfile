@@ -1,8 +1,8 @@
 FROM node:alpine
 
-ADD package* .
-RUN npm install
-ADD . .
-RUN npm run build
+ADD package* ./
+RUN npm install --production=false
+ADD ./ ./
+# RUN npm run build
 
-CMD ["node", "src/index.js"]
+CMD ["ts-node", "src/index.ts"]
