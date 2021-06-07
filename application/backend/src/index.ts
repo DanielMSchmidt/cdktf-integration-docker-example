@@ -9,6 +9,15 @@ const port = parseInt(process.env.PORT || "4000");
 app.use(cors());
 app.use(express.json());
 
+app.get("/", (_req, res) => {
+  res.sendStatus(200);
+});
+
+app.get("/ready", async (_req, res) => {
+  await dbMigrationDone;
+  res.sendStatus(200);
+});
+
 app.get("/posts", async (_req, res) => {
   try {
     await dbMigrationDone;

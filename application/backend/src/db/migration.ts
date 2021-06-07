@@ -2,11 +2,13 @@ import migrate from "node-pg-migrate";
 import { MigrationDirection } from "node-pg-migrate/dist/types";
 import { resolve } from "path";
 import { client, clientConfig } from "./config";
+import { Pool } from "pg";
 
 async function setupDb() {
-  console.log("Running DB migrations");
+  console.log("Running DB migrations", client, JSON.stringify(clientConfig));
   await migrate({
-    databaseUrl: `postgresql://${clientConfig.user}:${clientConfig.password}@${clientConfig.host}:${clientConfig.port}/${clientConfig.database}`,
+    // databaseUrl: `postgresql://${clientConfig.user}:${clientConfig.password}@${clientConfig.host}:${clientConfig.port}/${clientConfig.database}`,
+    dbClient: new Pool(clientConfig) as any,
     count: Infinity,
     createMigrationsSchema: true,
     createSchema: true,

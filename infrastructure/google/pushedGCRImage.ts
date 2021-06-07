@@ -17,15 +17,16 @@ export function pushedGCRImage(scope: Construct, sa: ServiceAccount) {
 
     const cmd = `echo '${privateKey}' | base64 -D | docker login -u _json_key --password-stdin https://gcr.io && docker build -t ${tag} ${path} && docker push ${tag}`;
     image.addOverride("provisioner.local-exec.command", cmd);
+    return image;
   };
 }
 
 export function hashedGCRImage(
   scope: Construct,
-  pusher: (tag: string, path: string) => void,
+  pusher: (tag: string, path: string) => Resource,
   projectName: string
 ) {
-  return (imageName: string, originalPath: string) => {
+  return (imageName: string, originalPath: string): [string, Resource] => {
     const { path, assetHash } = new TerraformAsset(
       scope,
       `image-context-${imageName}`,
@@ -35,8 +36,8 @@ export function hashedGCRImage(
     );
 
     const tag = `gcr.io/${projectName}/${imageName}:${assetHash}`;
-    pusher(tag, path);
-    return tag;
+    const resource = pusher(tag, path);
+    return [tag, resource];
   };
 }
 
