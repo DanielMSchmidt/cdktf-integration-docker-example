@@ -3,12 +3,14 @@ import {
   SqlDatabaseInstance,
   SqlUser,
 } from "@cdktf/provider-google";
+import * as random from "./.gen/providers/random";
 import { Construct } from "constructs";
 
 export function getDb(scope: Construct) {
   return (name: string) => {
+    const randomSuffix = new random.Pet(scope, `dbi-${name}-suffix`, {});
     const dbi = new SqlDatabaseInstance(scope, `dbi-${name}`, {
-      name,
+      name: `${name}-${randomSuffix.id}`,
       databaseVersion: "POSTGRES_13",
       deletionProtection: false,
       settings: [

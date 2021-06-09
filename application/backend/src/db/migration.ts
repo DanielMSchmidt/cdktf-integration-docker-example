@@ -7,7 +7,6 @@ import { Pool } from "pg";
 async function setupDb() {
   console.log("Running DB migrations", client, JSON.stringify(clientConfig));
   await migrate({
-    // databaseUrl: `postgresql://${clientConfig.user}:${clientConfig.password}@${clientConfig.host}:${clientConfig.port}/${clientConfig.database}`,
     dbClient: new Pool(clientConfig) as any,
     count: Infinity,
     createMigrationsSchema: true,

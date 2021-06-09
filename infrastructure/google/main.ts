@@ -2,18 +2,23 @@ import { Construct } from "constructs";
 import { App, TerraformOutput, TerraformStack } from "cdktf";
 import { hashedAndPushedGCRImage } from "./pushedGCRImage";
 import { getSa } from "./sa";
-import { GoogleProvider } from "@cdktf/provider-google";
+import { DnsManagedZone, GoogleProvider } from "@cdktf/provider-google";
 import { resolve } from "path";
 import { NullProvider } from "./.gen/providers/null/null-provider";
 import { getCloudRun } from "./cloudRun";
 import { getDb } from "./db";
 import { getStaticFiles } from "./staticFiles";
+import { RandomProvider } from "./.gen/providers/random/random-provider";
+import { Password } from "./.gen/providers/random/password";
+import { Uuid } from "./.gen/providers/random/uuid";
+
 class MyStack extends TerraformStack {
   constructor(scope: Construct, name: string) {
     super(scope, name);
     const project = "dschmidt-cdk-test";
 
     new NullProvider(this, "null");
+    new RandomProvider(this, "random");
     new GoogleProvider(this, "google", {
       zone: "us-central1-c",
       project,
@@ -34,17 +39,17 @@ class MyStack extends TerraformStack {
       resolve(__dirname, "../../application/backend")
     );
     const dbName = "application";
-    const dbUsername = "myuser";
-    const dbPassword = "mypassword"; // TODO: should be in secret
+    const dbUsername = new Uuid(this, "db-user", {}).result;
+    const dbPassword = new Password(this, "db-pwd", { length: 24 }).result;
     const dbInstance = db(name);
     dbInstance.createDBUser(dbUsername, dbPassword);
     dbInstance.createDb(dbName);
 
-    const dnsName = "docker-infra-demo.google.review-now.de";
-    // const zone = new DnsManagedZone(this, "dns", {
-    //   name,
-    //   dnsName: `${dnsName}.`,
-    // });
+    const dnsName = "docker-infra-demo.google.cdktf.xyz";
+    const zone = new DnsManagedZone(this, "dns", {
+      name,
+      dnsName: `${dnsName}.`,
+    });
 
     const domainMapping = cloudRun(
       "backend",
@@ -64,17 +69,11 @@ class MyStack extends TerraformStack {
 
     staticFiles(
       "cdktf-integration-example-frontend",
-      resolve(__dirname, "../../application/frontend/build")
+      resolve(__dirname, "../../application/frontend/build"),
+      zone
     );
 
     // https://medium.com/swlh/setup-a-static-website-cdn-with-terraform-on-gcp-23c6937382c6
-    // new DnsRecordSet(this, "dns-frontend", {
-    //   name: "frontend",
-    //   type: "A",
-    //   ttl: 300,
-    //   managedZone: zone.name,
-    //   rrdatas: [ip.address],
-    // });
 
     new TerraformOutput(this, "backend-ip", {
       value: domainMapping.status("0").resourceRecords,
