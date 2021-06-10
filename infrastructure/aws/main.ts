@@ -152,6 +152,14 @@ docker push ${repo.repositoryUrl}:${version}
             hostPort: 80,
           },
         ],
+        logConfiguration: {
+          logDriver: "awslogs",
+          options: {
+            "awslogs-group": `${cluster.name}/${name}`,
+            "awslogs-region": "us-east-1",
+            "awslogs-stream-prefix": name,
+          },
+        },
       },
     ]),
     family: "service",
