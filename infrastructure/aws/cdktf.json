@@ -5,7 +5,10 @@
     "kreuzwerker/docker@ ~>2.12.2",
     "hashicorp/null@ ~>3.1.0"
   ],
-  "terraformModules": ["terraform-aws-modules/vpc/aws@ ~> 3.0.0"],
+  "terraformModules": [
+    "terraform-aws-modules/vpc/aws@ ~> 3.0.0",
+    "terraform-aws-modules/rds/aws@~> 3.0.0"
+  ],
   "context": {
     "excludeStackIdFromLogicalIds": "true",
     "allowSepCharsInLogicalIds": "true"

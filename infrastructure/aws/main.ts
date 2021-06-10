@@ -8,6 +8,7 @@ import {
   EcsCluster,
   EcsService,
   EcsTaskDefinition,
+  IamRole,
   Lb,
   LbListener,
   LbListenerRule,
@@ -23,7 +24,8 @@ function DockerApplication(
   name: string,
   path: string,
   cluster: EcsCluster,
-  lb: LbListener,
+  lb: Lb,
+  lbl: LbListener,
   vpc: VPC
 ) {
   const p = (item: string) => `${name}-${item}`;
@@ -52,17 +54,101 @@ docker push ${repo.repositoryUrl}:${version}
 `
   );
 
+  const executionRole = new IamRole(scope, p("execution-role"), {
+    name: p("execution-role"),
+    inlinePolicy: [
+      {
+        name: "allow-ecr-pull",
+        policy: JSON.stringify({
+          Version: "2012-10-17",
+          Statement: [
+            {
+              Effect: "Allow",
+              Action: [
+                "ecr:GetAuthorizationToken",
+                "ecr:BatchCheckLayerAvailability",
+                "ecr:GetDownloadUrlForLayer",
+                "ecr:BatchGetImage",
+                "logs:CreateLogStream",
+                "logs:PutLogEvents",
+              ],
+              Resource: "*",
+            },
+          ],
+        }),
+      },
+    ],
+    assumeRolePolicy: JSON.stringify({
+      Version: "2012-10-17",
+      Statement: [
+        {
+          Action: "sts:AssumeRole",
+          Effect: "Allow",
+          Sid: "",
+          Principal: {
+            Service: "ecs-tasks.amazonaws.com",
+          },
+        },
+      ],
+    }),
+  });
+
+  const taskRole = new IamRole(scope, p("task-role"), {
+    name: p("task-role"),
+    inlinePolicy: [
+      {
+        name: "allow-logs",
+        policy: JSON.stringify({
+          Version: "2012-10-17",
+          Statement: [
+            {
+              Effect: "Allow",
+              Action: ["logs:CreateLogStream", "logs:PutLogEvents"],
+              Resource: "*",
+            },
+          ],
+        }),
+      },
+    ],
+    assumeRolePolicy: JSON.stringify({
+      Version: "2012-10-17",
+      Statement: [
+        {
+          Action: "sts:AssumeRole",
+          Effect: "Allow",
+          Sid: "",
+          Principal: {
+            Service: "ecs-tasks.amazonaws.com",
+          },
+        },
+      ],
+    }),
+  });
+
+  // https://docs.aws.amazon.com/AmazonECS/latest/developerguide/using_awslogs.html
   const task = new EcsTaskDefinition(scope, p("task"), {
     dependsOn: [image],
+    cpu: "256",
+    memory: "512",
+    requiresCompatibilities: ["FARGATE", "EC2"],
+    networkMode: "awsvpc",
+    executionRoleArn: executionRole.arn,
+    taskRoleArn: taskRole.arn,
     containerDefinitions: JSON.stringify([
       {
         name,
-        image: `${repo}:1.0.0`, // TODO: get dynamically
-        cpu: 1,
+        image: `${repo.repositoryUrl}:${version}`,
+        cpu: 256,
         memory: 512,
+        environment: [
+          {
+            name: "PORT",
+            value: "80",
+          },
+        ],
         portMappings: [
           {
-            containerPort: 4000,
+            containerPort: 80,
             hostPort: 80,
           },
         ],
@@ -72,16 +158,16 @@ docker push ${repo.repositoryUrl}:${version}
   });
 
   const targetGroup = new LbTargetGroup(scope, p("target-group"), {
-    dependsOn: [lb],
+    dependsOn: [lbl],
     name: p("target-group"),
     port: 80,
     protocol: "HTTP",
-    targetType: "instance",
+    targetType: "ip",
     vpcId: vpc.vpcIdOutput,
   });
 
   new LbListenerRule(scope, p("rule"), {
-    listenerArn: lb.arn,
+    listenerArn: lbl.arn,
     priority: 100,
     action: [
       {
@@ -92,25 +178,37 @@ docker push ${repo.repositoryUrl}:${version}
 
     condition: [
       {
-        hostHeader: [{ values: ["foo.bar"] }], // TODO: abstract
+        hostHeader: [{ values: [lb.dnsName] }],
       },
     ],
   });
 
-  new EcsService(scope, p("service"), {
-    dependsOn: [cluster, task, lb],
+  const service = new EcsService(scope, p("service"), {
+    dependsOn: [cluster, task, lbl],
     name,
+    launchType: "FARGATE",
     cluster: cluster.id,
     desiredCount: 1,
     taskDefinition: task.arn,
+    networkConfiguration: [
+      {
+        subnets: [],
+        assignPublicIp: true,
+      },
+    ],
     loadBalancer: [
       {
-        containerPort: 4000,
+        containerPort: 80,
         containerName: name,
         targetGroupArn: targetGroup.arn,
       },
     ],
   });
+
+  service.addOverride(
+    "network_configuration.0.subnets",
+    vpc.publicSubnetsOutput
+  );
 }
 
 // TODO: tag everything
@@ -127,29 +225,32 @@ class MyStack extends TerraformStack {
 
     const cluster = new EcsCluster(this, "cluster", {
       name,
+      capacityProviders: ["FARGATE"],
     });
 
     const vpc = new VPC(this, "vpc", {
       name,
       cidr: "10.0.0.0/16",
       azs: ["a", "b", "c"].map((i) => `${region}${i}`),
-      privateSubnets: ["10.0.1.0/24"],
-      publicSubnets: ["10.0.2.0/24"],
+      privateSubnets: ["10.0.1.0/24", "10.0.2.0/24", "10.0.3.0/24"],
+      publicSubnets: ["10.0.101.0/24", "10.0.102.0/24", "10.0.103.0/24"],
       enableNatGateway: true,
+      singleNatGateway: true,
     });
 
     const lb = new Lb(this, "lb", {
       name,
       internal: false,
       loadBalancerType: "application",
-      subnets: [...(vpc.intraSubnets || []), ...(vpc.publicSubnets || [])],
       securityGroups: [vpc.defaultSecurityGroupIdOutput],
     });
+    // Due to output being reference to string array
+    lb.addOverride("subnets", vpc.publicSubnetsOutput);
 
     const lbl = new LbListener(this, "lb-listener", {
       loadBalancerArn: lb.arn,
-      port: 443,
-      protocol: "HTTPS",
+      port: 80,
+      protocol: "HTTP",
       defaultAction: [
         {
           type: "fixed-response",
@@ -173,6 +274,7 @@ class MyStack extends TerraformStack {
       "backend",
       path.resolve(__dirname, "../../application/backend"),
       cluster,
+      lb,
       lbl,
       vpc
     );
