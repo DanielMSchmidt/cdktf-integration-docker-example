@@ -3,6 +3,7 @@ import { App, TerraformAsset, TerraformOutput, TerraformStack } from "cdktf";
 import * as path from "path";
 import {
   AwsProvider,
+  CloudwatchLogGroup,
   DataAwsEcrAuthorizationToken,
   EcrRepository,
   EcsCluster,
@@ -13,11 +14,14 @@ import {
   LbListener,
   LbListenerRule,
   LbTargetGroup,
+  SecurityGroup,
 } from "@cdktf/provider-aws";
 import { DockerProvider } from "./.gen/providers/docker/docker-provider";
 import { NullProvider } from "./.gen/providers/null/null-provider";
 import { Resource } from "./.gen/providers/null/resource";
 import { TerraformAwsModulesVpcAws as VPC } from "./.gen/modules/terraform-aws-modules/vpc/aws";
+import { TerraformAwsModulesRdsAws } from "./.gen/modules/terraform-aws-modules/rds/aws";
+import { Password } from "./.gen/providers/random/password";
 
 function DockerApplication(
   scope: Construct,
@@ -43,16 +47,84 @@ function DockerApplication(
   });
 
   const version = require(`${path}/package.json`).version;
+  const tag = `${repo.repositoryUrl}:${version}-${asset.assetHash}`;
   // Workaround due to https://github.com/kreuzwerker/terraform-provider-docker/issues/189
-  const image = new Resource(scope, p("image"), {});
+  const image = new Resource(scope, p(`image-${tag}`), {});
   image.addOverride(
     "provisioner.local-exec.command",
     `
 docker login -u ${auth.userName} -p ${auth.password} ${auth.proxyEndpoint} &&
-docker build -t ${repo.repositoryUrl}:${version} ${asset.path} &&
-docker push ${repo.repositoryUrl}:${version}
+docker build -t ${tag} ${asset.path} &&
+docker push ${tag}
 `
   );
+
+  const password = new Password(scope, "db-password", {
+    length: 16,
+    special: false,
+  });
+
+  const dbPort = 5432;
+  const serviceSecurityGroup = new SecurityGroup(
+    scope,
+    "service-security-group",
+    {
+      vpcId: vpc.vpcIdOutput,
+      ingress: [
+        {
+          protocol: "TCP",
+          fromPort: 80,
+          toPort: 80,
+          securityGroups: lb.securityGroups,
+        },
+      ],
+      egress: [
+        {
+          fromPort: 0,
+          toPort: 0,
+          protocol: "-1",
+          cidrBlocks: ["0.0.0.0/0"],
+          ipv6CidrBlocks: ["::/0"],
+        },
+      ],
+    }
+  );
+  const dbSecurityGroup = new SecurityGroup(scope, "db-security-group", {
+    vpcId: vpc.vpcIdOutput,
+    ingress: [
+      {
+        fromPort: dbPort,
+        toPort: dbPort,
+        protocol: "TCP",
+        securityGroups: [serviceSecurityGroup.id],
+      },
+    ],
+  });
+
+  const db = new TerraformAwsModulesRdsAws(scope, "db", {
+    identifier: "cdkday-test",
+
+    engine: "postgres",
+    engineVersion: "11.10",
+    family: "postgres11",
+    instanceClass: "db.t3.micro",
+    allocatedStorage: "5",
+
+    createDbOptionGroup: false,
+    createDbParameterGroup: false,
+    applyImmediately: true,
+
+    name: "demodb",
+    port: String(dbPort),
+    username: "cdkday",
+    password: password.result,
+
+    maintenanceWindow: "Mon:00:00-Mon:03:00",
+    backupWindow: "03:00-06:00",
+
+    subnetIds: vpc.databaseSubnetsOutput as unknown as any, // 🙈
+    vpcSecurityGroupIds: [dbSecurityGroup.id],
+  });
 
   const executionRole = new IamRole(scope, p("execution-role"), {
     name: p("execution-role"),
@@ -125,7 +197,11 @@ docker push ${repo.repositoryUrl}:${version}
     }),
   });
 
-  // https://docs.aws.amazon.com/AmazonECS/latest/developerguide/using_awslogs.html
+  const logGroup = new CloudwatchLogGroup(scope, p("loggroup"), {
+    name: `${cluster.name}/${name}`,
+    retentionInDays: 30,
+  });
+
   const task = new EcsTaskDefinition(scope, p("task"), {
     dependsOn: [image],
     cpu: "256",
@@ -137,13 +213,33 @@ docker push ${repo.repositoryUrl}:${version}
     containerDefinitions: JSON.stringify([
       {
         name,
-        image: `${repo.repositoryUrl}:${version}`,
+        image: tag,
         cpu: 256,
         memory: 512,
         environment: [
           {
             name: "PORT",
             value: "80",
+          },
+          {
+            name: "POSTGRES_USER",
+            value: db.username,
+          },
+          {
+            name: "POSTGRES_PASSWORD",
+            value: db.password,
+          },
+          {
+            name: "POSTGRES_DB",
+            value: db.name,
+          },
+          {
+            name: "POSTGRES_HOST",
+            value: db.dbInstanceAddressOutput,
+          },
+          {
+            name: "POSTGRES_PORT",
+            value: db.dbInstancePortOutput,
           },
         ],
         portMappings: [
@@ -155,7 +251,7 @@ docker push ${repo.repositoryUrl}:${version}
         logConfiguration: {
           logDriver: "awslogs",
           options: {
-            "awslogs-group": `${cluster.name}/${name}`,
+            "awslogs-group": logGroup.name,
             "awslogs-region": "us-east-1",
             "awslogs-stream-prefix": name,
           },
@@ -172,6 +268,12 @@ docker push ${repo.repositoryUrl}:${version}
     protocol: "HTTP",
     targetType: "ip",
     vpcId: vpc.vpcIdOutput,
+    healthCheck: [
+      {
+        enabled: true,
+        path: "/ready",
+      },
+    ],
   });
 
   new LbListenerRule(scope, p("rule"), {
@@ -202,6 +304,7 @@ docker push ${repo.repositoryUrl}:${version}
       {
         subnets: [],
         assignPublicIp: true,
+        securityGroups: [serviceSecurityGroup.id],
       },
     ],
     loadBalancer: [
@@ -242,15 +345,45 @@ class MyStack extends TerraformStack {
       azs: ["a", "b", "c"].map((i) => `${region}${i}`),
       privateSubnets: ["10.0.1.0/24", "10.0.2.0/24", "10.0.3.0/24"],
       publicSubnets: ["10.0.101.0/24", "10.0.102.0/24", "10.0.103.0/24"],
+      databaseSubnets: ["10.0.201.0/24", "10.0.202.0/24", "10.0.203.0/24"],
+      createDatabaseSubnetGroup: true,
       enableNatGateway: true,
       singleNatGateway: true,
     });
 
+    const lbSecurityGroup = new SecurityGroup(this, "lb-security-group", {
+      vpcId: vpc.vpcIdOutput,
+      ingress: [
+        {
+          protocol: "TCP",
+          fromPort: 80,
+          toPort: 80,
+          cidrBlocks: ["0.0.0.0/0"],
+          ipv6CidrBlocks: ["::/0"],
+        },
+        {
+          protocol: "TCP",
+          fromPort: 443,
+          toPort: 443,
+          cidrBlocks: ["0.0.0.0/0"],
+          ipv6CidrBlocks: ["::/0"],
+        },
+      ],
+      egress: [
+        {
+          fromPort: 0,
+          toPort: 0,
+          protocol: "-1",
+          cidrBlocks: ["0.0.0.0/0"],
+          ipv6CidrBlocks: ["::/0"],
+        },
+      ],
+    });
     const lb = new Lb(this, "lb", {
       name,
       internal: false,
       loadBalancerType: "application",
-      securityGroups: [vpc.defaultSecurityGroupIdOutput],
+      securityGroups: [lbSecurityGroup.id],
     });
     // Due to output being reference to string array
     lb.addOverride("subnets", vpc.publicSubnetsOutput);
