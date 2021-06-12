@@ -296,6 +296,8 @@ docker push ${tag}
     condition: [
       {
         hostHeader: [{ values: [lb.dnsName] }],
+      },
+      {
         pathPattern: [{ values: ["/backend/*"] }],
       },
     ],
@@ -520,7 +522,8 @@ class MyStack extends TerraformStack {
       defaultRootObject: "index.html",
       restrictions: [{ geoRestriction: [{ restrictionType: "none" }] }],
       viewerCertificate: [{ cloudfrontDefaultCertificate: true }],
-      aliases: [lb.dnsName],
+      // To add an alternate domain name (CNAME) to a CloudFront distribution, you must attach a trusted certificate that validates your authorization to use the domain name. For more details, see: https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/CNAMEs.html#alternate-domain-names-requirements
+      // aliases: [lb.dnsName],
     });
   }
 }
