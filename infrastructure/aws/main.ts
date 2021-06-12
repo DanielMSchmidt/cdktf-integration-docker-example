@@ -1,8 +1,10 @@
 import { Construct } from "constructs";
 import { App, TerraformAsset, TerraformOutput, TerraformStack } from "cdktf";
 import * as path from "path";
+import { sync as glob } from "glob";
 import {
   AwsProvider,
+  CloudfrontDistribution,
   CloudwatchLogGroup,
   DataAwsEcrAuthorizationToken,
   EcrRepository,
@@ -14,6 +16,9 @@ import {
   LbListener,
   LbListenerRule,
   LbTargetGroup,
+  S3Bucket,
+  S3BucketObject,
+  S3BucketPolicy,
   SecurityGroup,
 } from "@cdktf/provider-aws";
 import { DockerProvider } from "./.gen/providers/docker/docker-provider";
@@ -22,6 +27,8 @@ import { Resource } from "./.gen/providers/null/resource";
 import { TerraformAwsModulesVpcAws as VPC } from "./.gen/modules/terraform-aws-modules/vpc/aws";
 import { TerraformAwsModulesRdsAws } from "./.gen/modules/terraform-aws-modules/rds/aws";
 import { Password } from "./.gen/providers/random/password";
+
+const S3_ORIGIN_ID = "s3Origin";
 
 function DockerApplication(
   scope: Construct,
@@ -289,6 +296,7 @@ docker push ${tag}
     condition: [
       {
         hostHeader: [{ values: [lb.dnsName] }],
+        pathPattern: [{ values: ["/backend/*"] }],
       },
     ],
   });
@@ -419,6 +427,101 @@ class MyStack extends TerraformStack {
       lbl,
       vpc
     );
+
+    const { path: contentPath, assetHash: contentHash } = new TerraformAsset(
+      this,
+      "frontend",
+      {
+        path: path.resolve(__dirname, "../../application/frontend/build"),
+      }
+    );
+
+    const bucket = new S3Bucket(this, "bucket", {
+      bucketPrefix: `docker-example-frontend`,
+      website: [
+        {
+          indexDocument: "index.html",
+          errorDocument: "index.html",
+        },
+      ],
+      tags: {
+        "hc-internet-facing": "true",
+      },
+    });
+
+    // TODO: glob files
+    const files = glob("**/*.{json,js,html,png,ico,txt,map}", {
+      cwd: contentPath,
+    });
+
+    files.forEach((f) => {
+      const filePath = path.resolve(contentPath, f);
+      new S3BucketObject(this, `${bucket.id}/${f}/${contentHash}`, {
+        bucket: bucket.id,
+        key: f,
+        source: filePath,
+        etag: `filemd5("${filePath}")`,
+      });
+    });
+
+    new S3BucketPolicy(this, "s3_policy", {
+      bucket: bucket.id,
+      policy: JSON.stringify({
+        Version: "2012-10-17",
+        Id: "PolicyForWebsiteEndpointsPublicContent",
+        Statement: [
+          {
+            Sid: "PublicRead",
+            Effect: "Allow",
+            Principal: "*",
+            Action: ["s3:GetObject"],
+            Resource: [`${bucket.arn}/*`, `${bucket.arn}`],
+          },
+        ],
+      }),
+    });
+
+    new CloudfrontDistribution(this, "cf", {
+      comment: `Docker example frontend`,
+      enabled: true,
+      defaultCacheBehavior: [
+        {
+          allowedMethods: [
+            "DELETE",
+            "GET",
+            "HEAD",
+            "OPTIONS",
+            "PATCH",
+            "POST",
+            "PUT",
+          ],
+          cachedMethods: ["GET", "HEAD"],
+          targetOriginId: S3_ORIGIN_ID,
+          viewerProtocolPolicy: "redirect-to-https",
+          forwardedValues: [
+            { queryString: false, cookies: [{ forward: "none" }] },
+          ],
+        },
+      ],
+      origin: [
+        {
+          originId: S3_ORIGIN_ID,
+          domainName: bucket.websiteEndpoint,
+          customOriginConfig: [
+            {
+              originProtocolPolicy: "http-only",
+              httpPort: 80,
+              httpsPort: 443,
+              originSslProtocols: ["TLSv1.2", "TLSv1.1", "TLSv1"],
+            },
+          ],
+        },
+      ],
+      defaultRootObject: "index.html",
+      restrictions: [{ geoRestriction: [{ restrictionType: "none" }] }],
+      viewerCertificate: [{ cloudfrontDefaultCertificate: true }],
+      aliases: [lb.dnsName],
+    });
   }
 }
 
