@@ -31,9 +31,15 @@ import { Password } from "./.gen/providers/random/password";
 
 const S3_ORIGIN_ID = "s3Origin";
 
+const tags = {
+  team: "cdk",
+  owner: "dschmidt",
+};
+
 function PushedECRImage(scope: Construct, name: string, imagePath: string) {
   const repo = new EcrRepository(scope, `${name}-ecr`, {
     name,
+    tags,
   });
 
   const auth = new DataAwsEcrAuthorizationToken(scope, `${name}-auth`, {
@@ -84,6 +90,7 @@ function PostgresDB(
         securityGroups: [serviceSecurityGroup.id],
       },
     ],
+    tags,
   });
 
   const db = new TerraformAwsModulesRdsAws(scope, "db", {
@@ -109,6 +116,7 @@ function PostgresDB(
 
     subnetIds: vpc.databaseSubnetsOutput as unknown as any, // 🙈
     vpcSecurityGroupIds: [dbSecurityGroup.id],
+    tags,
   });
 
   return db;
@@ -118,6 +126,7 @@ function Cluster(scope: Construct, name: string) {
   const cluster = new EcsCluster(scope, name, {
     name,
     capacityProviders: ["FARGATE"],
+    tags,
   });
 
   return {
@@ -130,6 +139,7 @@ function Cluster(scope: Construct, name: string) {
     ) {
       const executionRole = new IamRole(scope, `${name}-execution-role`, {
         name: `execution-role`,
+        tags,
         inlinePolicy: [
           {
             name: "allow-ecr-pull",
@@ -169,6 +179,7 @@ function Cluster(scope: Construct, name: string) {
 
       const taskRole = new IamRole(scope, `${name}-task-role`, {
         name: `task-role`,
+        tags,
         inlinePolicy: [
           {
             name: "allow-logs",
@@ -202,10 +213,12 @@ function Cluster(scope: Construct, name: string) {
       const logGroup = new CloudwatchLogGroup(scope, `${name}-loggroup`, {
         name: `${cluster.name}/${name}`,
         retentionInDays: 30,
+        tags,
       });
 
       const task = new EcsTaskDefinition(scope, `${name}-task`, {
         dependsOn: [image],
+        tags,
         cpu: "256",
         memory: "512",
         requiresCompatibilities: ["FARGATE", "EC2"],
@@ -257,6 +270,7 @@ function LoadBalancer(
     `${name}-lb-security-group`,
     {
       vpcId: vpc.vpcIdOutput,
+      tags,
       ingress: [
         {
           protocol: "TCP",
@@ -286,6 +300,7 @@ function LoadBalancer(
   );
   const lb = new Lb(scope, `${name}-lb`, {
     name,
+    tags,
     internal: false,
     loadBalancerType: "application",
     securityGroups: [lbSecurityGroup.id],
@@ -297,6 +312,7 @@ function LoadBalancer(
     loadBalancerArn: lb.arn,
     port: 80,
     protocol: "HTTP",
+    tags,
     defaultAction: [
       {
         type: "fixed-response",
@@ -320,6 +336,7 @@ function LoadBalancer(
     ) {
       const targetGroup = new LbTargetGroup(scope, `${name}-target-group`, {
         dependsOn: [lbl],
+        tags,
         name: `target-group`,
         port: 80,
         protocol: "HTTP",
@@ -336,7 +353,7 @@ function LoadBalancer(
       new LbListenerRule(scope, `${name}-rule`, {
         listenerArn: lbl.arn,
         priority: 100,
-
+        tags,
         action: [
           {
             type: "forward",
@@ -353,6 +370,7 @@ function LoadBalancer(
 
       const service = new EcsService(scope, `${name}-service`, {
         dependsOn: [lbl],
+        tags,
         name,
         launchType: "FARGATE",
         cluster: cluster.id,
@@ -397,6 +415,7 @@ function PublicS3Bucket(
 
   const bucket = new S3Bucket(scope, `${name}-bucket`, {
     bucketPrefix: `${name}-frontend`,
+
     website: [
       {
         indexDocument: "index.html",
@@ -404,6 +423,7 @@ function PublicS3Bucket(
       },
     ],
     tags: {
+      ...tags,
       "hc-internet-facing": "true",
     },
   });
@@ -416,6 +436,7 @@ function PublicS3Bucket(
     const filePath = path.join(contentPath, f);
     new S3BucketObject(scope, `${bucket.id}/${f}/${contentHash}`, {
       bucket: bucket.id,
+      tags,
       key: f,
       source: filePath,
       contentType: mime(path.extname(f)) || "text/html",
@@ -457,6 +478,7 @@ class MyStack extends TerraformStack {
 
     const vpc = new VPC(this, "vpc", {
       name,
+      tags,
       cidr: "10.0.0.0/16",
       azs: ["a", "b", "c"].map((i) => `${region}${i}`),
       privateSubnets: ["10.0.1.0/24", "10.0.2.0/24", "10.0.3.0/24"],
@@ -479,6 +501,7 @@ class MyStack extends TerraformStack {
       `${name}-service-security-group`,
       {
         vpcId: vpc.vpcIdOutput,
+        tags,
         ingress: [
           {
             protocol: "TCP",
@@ -525,6 +548,7 @@ class MyStack extends TerraformStack {
 
     const cdn = new CloudfrontDistribution(this, "cf", {
       comment: `Docker example frontend`,
+      tags,
       enabled: true,
       defaultCacheBehavior: [
         {
