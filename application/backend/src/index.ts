@@ -23,7 +23,9 @@ app.get("/ready", async (_req, res) => {
   res.sendStatus(200);
 });
 
-app.get("/posts", async (_req, res) => {
+const applicationRouter = express.Router();
+
+applicationRouter.get("/posts", async (_req, res) => {
   try {
     await dbMigrationDone;
     const { rows } = await db.query("SELECT id,content FROM posts");
@@ -37,7 +39,7 @@ app.get("/posts", async (_req, res) => {
   }
 });
 
-app.get("/posts/:id/detail", async (req, res) => {
+applicationRouter.get("/posts/:id/detail", async (req, res) => {
   await dbMigrationDone;
 
   const { rows } = await db.query("SELECT * FROM posts WHERE id = $1", [
@@ -47,7 +49,7 @@ app.get("/posts/:id/detail", async (req, res) => {
   res.json(rows[0]);
 });
 
-app.post("/posts", async (req, res) => {
+applicationRouter.post("/posts", async (req, res) => {
   const { content, author } = req.body;
   await dbMigrationDone;
   await db.query("INSERT INTO posts (content, author) VALUES ($1, $2)", [
@@ -56,6 +58,8 @@ app.post("/posts", async (req, res) => {
   ]);
   res.sendStatus(201);
 });
+
+app.use("/backend", applicationRouter);
 
 app.listen(port, () => {
   console.log(`Started at http://localhost:${port}`);

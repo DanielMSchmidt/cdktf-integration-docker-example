@@ -2,6 +2,7 @@ import { Construct } from "constructs";
 import { App, TerraformAsset, TerraformOutput, TerraformStack } from "cdktf";
 import * as path from "path";
 import { sync as glob } from "glob";
+import { lookup as mime } from "mime-types";
 import {
   AwsProvider,
   CloudfrontDistribution,
@@ -286,6 +287,7 @@ docker push ${tag}
   new LbListenerRule(scope, p("rule"), {
     listenerArn: lbl.arn,
     priority: 100,
+
     action: [
       {
         type: "forward",
@@ -295,10 +297,7 @@ docker push ${tag}
 
     condition: [
       {
-        hostHeader: [{ values: [lb.dnsName] }],
-      },
-      {
-        pathPattern: [{ values: ["/backend/*"] }],
+        pathPattern: [{ values: ["/*"] }],
       },
     ],
   });
@@ -409,15 +408,11 @@ class MyStack extends TerraformStack {
             {
               contentType: "text/plain",
               statusCode: "404",
-              messageBody: "Could not find the resource your are looking for",
+              messageBody: "Could not find the resource you are looking for",
             },
           ],
         },
       ],
-    });
-
-    new TerraformOutput(this, "lb-dns", {
-      value: lb.dnsName,
     });
 
     DockerApplication(
@@ -430,11 +425,15 @@ class MyStack extends TerraformStack {
       vpc
     );
 
+    const absoluteContentPath = path.resolve(
+      __dirname,
+      "../../application/frontend/build"
+    );
     const { path: contentPath, assetHash: contentHash } = new TerraformAsset(
       this,
       "frontend",
       {
-        path: path.resolve(__dirname, "../../application/frontend/build"),
+        path: absoluteContentPath,
       }
     );
 
@@ -452,16 +451,17 @@ class MyStack extends TerraformStack {
     });
 
     // TODO: glob files
-    const files = glob("**/*.{json,js,html,png,ico,txt,map}", {
-      cwd: contentPath,
+    const files = glob("**/*.{json,js,html,png,ico,txt,map,css}", {
+      cwd: absoluteContentPath,
     });
 
     files.forEach((f) => {
-      const filePath = path.resolve(contentPath, f);
+      const filePath = path.join(contentPath, f);
       new S3BucketObject(this, `${bucket.id}/${f}/${contentHash}`, {
         bucket: bucket.id,
         key: f,
         source: filePath,
+        contentType: mime(path.extname(f)) || "text/html",
         etag: `filemd5("${filePath}")`,
       });
     });
@@ -483,7 +483,7 @@ class MyStack extends TerraformStack {
       }),
     });
 
-    new CloudfrontDistribution(this, "cf", {
+    const cdn = new CloudfrontDistribution(this, "cf", {
       comment: `Docker example frontend`,
       enabled: true,
       defaultCacheBehavior: [
@@ -518,12 +518,55 @@ class MyStack extends TerraformStack {
             },
           ],
         },
+        {
+          originId: "backend", // extract to constant
+          domainName: lb.dnsName,
+          customOriginConfig: [
+            {
+              originProtocolPolicy: "http-only",
+              httpPort: 80,
+              httpsPort: 443,
+              originSslProtocols: ["TLSv1.2", "TLSv1.1", "TLSv1"],
+            },
+          ],
+        },
+      ],
+      orderedCacheBehavior: [
+        {
+          allowedMethods: [
+            "HEAD",
+            "DELETE",
+            "POST",
+            "GET",
+            "OPTIONS",
+            "PUT",
+            "PATCH",
+          ],
+          cachedMethods: ["HEAD", "GET"],
+          pathPattern: "/backend/*",
+          targetOriginId: "backend",
+          defaultTtl: 10,
+          viewerProtocolPolicy: "redirect-to-https",
+          forwardedValues: [
+            {
+              queryString: true,
+              headers: ["*"],
+              cookies: [
+                {
+                  forward: "all",
+                },
+              ],
+            },
+          ],
+        },
       ],
       defaultRootObject: "index.html",
       restrictions: [{ geoRestriction: [{ restrictionType: "none" }] }],
       viewerCertificate: [{ cloudfrontDefaultCertificate: true }],
-      // To add an alternate domain name (CNAME) to a CloudFront distribution, you must attach a trusted certificate that validates your authorization to use the domain name. For more details, see: https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/CNAMEs.html#alternate-domain-names-requirements
-      // aliases: [lb.dnsName],
+    });
+
+    new TerraformOutput(this, "lb-dns", {
+      value: cdn.domainName,
     });
   }
 }
