@@ -20,7 +20,8 @@ export function usePosts() {
         res.json()
       );
       const rows: Post[] = response.data;
-      setPosts(rows.reverse());
+
+      setPosts(rows);
     } catch (err) {
       console.error("Error fetching posts:", err);
       setError(err);

@@ -450,7 +450,6 @@ class MyStack extends TerraformStack {
       },
     });
 
-    // TODO: glob files
     const files = glob("**/*.{json,js,html,png,ico,txt,map,css}", {
       cwd: absoluteContentPath,
     });

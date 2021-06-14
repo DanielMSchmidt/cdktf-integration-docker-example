@@ -10,6 +10,8 @@
     "build": "tsc",
     "synth": "cdktf synth",
     "compile": "tsc --pretty",
+    "predeploy": "cd ../../application/frontend && npm run build",
+    "deploy": "cdktf deploy",
     "watch": "tsc -w",
     "test": "echo ok",
     "upgrade": "npm i cdktf@latest cdktf-cli@latest",
