@@ -31,33 +31,24 @@ import { Password } from "./.gen/providers/random/password";
 
 const S3_ORIGIN_ID = "s3Origin";
 
-function DockerApplication(
-  scope: Construct,
-  name: string,
-  path: string,
-  cluster: EcsCluster,
-  lb: Lb,
-  lbl: LbListener,
-  vpc: VPC
-) {
-  const p = (item: string) => `${name}-${item}`;
-  const repo = new EcrRepository(scope, p("ecr"), {
+function PushedECRImage(scope: Construct, name: string, imagePath: string) {
+  const repo = new EcrRepository(scope, `${name}-ecr`, {
     name,
   });
 
-  const auth = new DataAwsEcrAuthorizationToken(scope, p("auth"), {
+  const auth = new DataAwsEcrAuthorizationToken(scope, `${name}-auth`, {
     dependsOn: [repo],
     registryId: repo.registryId,
   });
 
-  const asset = new TerraformAsset(scope, p("project"), {
-    path,
+  const asset = new TerraformAsset(scope, `${name}-project`, {
+    path: imagePath,
   });
 
-  const version = require(`${path}/package.json`).version;
+  const version = require(`${imagePath}/package.json`).version;
   const tag = `${repo.repositoryUrl}:${version}-${asset.assetHash}`;
   // Workaround due to https://github.com/kreuzwerker/terraform-provider-docker/issues/189
-  const image = new Resource(scope, p(`image-${tag}`), {});
+  const image = new Resource(scope, `${name}-image-${tag}`, {});
   image.addOverride(
     "provisioner.local-exec.command",
     `
@@ -67,36 +58,22 @@ docker push ${tag}
 `
   );
 
-  const password = new Password(scope, "db-password", {
+  return { image, tag };
+}
+
+function PostgresDB(
+  scope: Construct,
+  name: string,
+  vpc: VPC,
+  serviceSecurityGroup: SecurityGroup
+) {
+  const password = new Password(scope, `${name}-db-password`, {
     length: 16,
     special: false,
   });
 
   const dbPort = 5432;
-  const serviceSecurityGroup = new SecurityGroup(
-    scope,
-    "service-security-group",
-    {
-      vpcId: vpc.vpcIdOutput,
-      ingress: [
-        {
-          protocol: "TCP",
-          fromPort: 80,
-          toPort: 80,
-          securityGroups: lb.securityGroups,
-        },
-      ],
-      egress: [
-        {
-          fromPort: 0,
-          toPort: 0,
-          protocol: "-1",
-          cidrBlocks: ["0.0.0.0/0"],
-          ipv6CidrBlocks: ["::/0"],
-        },
-      ],
-    }
-  );
+
   const dbSecurityGroup = new SecurityGroup(scope, "db-security-group", {
     vpcId: vpc.vpcIdOutput,
     ingress: [
@@ -110,7 +87,7 @@ docker push ${tag}
   });
 
   const db = new TerraformAwsModulesRdsAws(scope, "db", {
-    identifier: "cdkday-test",
+    identifier: `${name}-db`,
 
     engine: "postgres",
     engineVersion: "11.10",
@@ -122,9 +99,9 @@ docker push ${tag}
     createDbParameterGroup: false,
     applyImmediately: true,
 
-    name: "demodb",
+    name,
     port: String(dbPort),
-    username: "cdkday",
+    username: `${name}user`,
     password: password.result,
 
     maintenanceWindow: "Mon:00:00-Mon:03:00",
@@ -134,233 +111,151 @@ docker push ${tag}
     vpcSecurityGroupIds: [dbSecurityGroup.id],
   });
 
-  const executionRole = new IamRole(scope, p("execution-role"), {
-    name: p("execution-role"),
-    inlinePolicy: [
-      {
-        name: "allow-ecr-pull",
-        policy: JSON.stringify({
-          Version: "2012-10-17",
-          Statement: [
-            {
-              Effect: "Allow",
-              Action: [
-                "ecr:GetAuthorizationToken",
-                "ecr:BatchCheckLayerAvailability",
-                "ecr:GetDownloadUrlForLayer",
-                "ecr:BatchGetImage",
-                "logs:CreateLogStream",
-                "logs:PutLogEvents",
-              ],
-              Resource: "*",
-            },
-          ],
-        }),
-      },
-    ],
-    assumeRolePolicy: JSON.stringify({
-      Version: "2012-10-17",
-      Statement: [
-        {
-          Action: "sts:AssumeRole",
-          Effect: "Allow",
-          Sid: "",
-          Principal: {
-            Service: "ecs-tasks.amazonaws.com",
-          },
-        },
-      ],
-    }),
-  });
-
-  const taskRole = new IamRole(scope, p("task-role"), {
-    name: p("task-role"),
-    inlinePolicy: [
-      {
-        name: "allow-logs",
-        policy: JSON.stringify({
-          Version: "2012-10-17",
-          Statement: [
-            {
-              Effect: "Allow",
-              Action: ["logs:CreateLogStream", "logs:PutLogEvents"],
-              Resource: "*",
-            },
-          ],
-        }),
-      },
-    ],
-    assumeRolePolicy: JSON.stringify({
-      Version: "2012-10-17",
-      Statement: [
-        {
-          Action: "sts:AssumeRole",
-          Effect: "Allow",
-          Sid: "",
-          Principal: {
-            Service: "ecs-tasks.amazonaws.com",
-          },
-        },
-      ],
-    }),
-  });
-
-  const logGroup = new CloudwatchLogGroup(scope, p("loggroup"), {
-    name: `${cluster.name}/${name}`,
-    retentionInDays: 30,
-  });
-
-  const task = new EcsTaskDefinition(scope, p("task"), {
-    dependsOn: [image],
-    cpu: "256",
-    memory: "512",
-    requiresCompatibilities: ["FARGATE", "EC2"],
-    networkMode: "awsvpc",
-    executionRoleArn: executionRole.arn,
-    taskRoleArn: taskRole.arn,
-    containerDefinitions: JSON.stringify([
-      {
-        name,
-        image: tag,
-        cpu: 256,
-        memory: 512,
-        environment: [
-          {
-            name: "PORT",
-            value: "80",
-          },
-          {
-            name: "POSTGRES_USER",
-            value: db.username,
-          },
-          {
-            name: "POSTGRES_PASSWORD",
-            value: db.password,
-          },
-          {
-            name: "POSTGRES_DB",
-            value: db.name,
-          },
-          {
-            name: "POSTGRES_HOST",
-            value: db.dbInstanceAddressOutput,
-          },
-          {
-            name: "POSTGRES_PORT",
-            value: db.dbInstancePortOutput,
-          },
-        ],
-        portMappings: [
-          {
-            containerPort: 80,
-            hostPort: 80,
-          },
-        ],
-        logConfiguration: {
-          logDriver: "awslogs",
-          options: {
-            "awslogs-group": logGroup.name,
-            "awslogs-region": "us-east-1",
-            "awslogs-stream-prefix": name,
-          },
-        },
-      },
-    ]),
-    family: "service",
-  });
-
-  const targetGroup = new LbTargetGroup(scope, p("target-group"), {
-    dependsOn: [lbl],
-    name: p("target-group"),
-    port: 80,
-    protocol: "HTTP",
-    targetType: "ip",
-    vpcId: vpc.vpcIdOutput,
-    healthCheck: [
-      {
-        enabled: true,
-        path: "/ready",
-      },
-    ],
-  });
-
-  new LbListenerRule(scope, p("rule"), {
-    listenerArn: lbl.arn,
-    priority: 100,
-
-    action: [
-      {
-        type: "forward",
-        targetGroupArn: targetGroup.arn,
-      },
-    ],
-
-    condition: [
-      {
-        pathPattern: [{ values: ["/*"] }],
-      },
-    ],
-  });
-
-  const service = new EcsService(scope, p("service"), {
-    dependsOn: [cluster, task, lbl],
-    name,
-    launchType: "FARGATE",
-    cluster: cluster.id,
-    desiredCount: 1,
-    taskDefinition: task.arn,
-    networkConfiguration: [
-      {
-        subnets: [],
-        assignPublicIp: true,
-        securityGroups: [serviceSecurityGroup.id],
-      },
-    ],
-    loadBalancer: [
-      {
-        containerPort: 80,
-        containerName: name,
-        targetGroupArn: targetGroup.arn,
-      },
-    ],
-  });
-
-  service.addOverride(
-    "network_configuration.0.subnets",
-    vpc.publicSubnetsOutput
-  );
+  return db;
 }
 
-// TODO: tag everything
-class MyStack extends TerraformStack {
-  constructor(scope: Construct, name: string) {
-    super(scope, name);
-    const region = "us-east-1";
+function Cluster(scope: Construct, name: string) {
+  const cluster = new EcsCluster(scope, name, {
+    name,
+    capacityProviders: ["FARGATE"],
+  });
 
-    new AwsProvider(this, "aws", {
-      region,
-    });
-    new DockerProvider(this, "docker");
-    new NullProvider(this, "provider", {});
+  return {
+    cluster,
+    runDockerImage(
+      name: string,
+      tag: string,
+      image: Resource,
+      env: Record<string, string | undefined>
+    ) {
+      const executionRole = new IamRole(scope, `${name}-execution-role`, {
+        name: `execution-role`,
+        inlinePolicy: [
+          {
+            name: "allow-ecr-pull",
+            policy: JSON.stringify({
+              Version: "2012-10-17",
+              Statement: [
+                {
+                  Effect: "Allow",
+                  Action: [
+                    "ecr:GetAuthorizationToken",
+                    "ecr:BatchCheckLayerAvailability",
+                    "ecr:GetDownloadUrlForLayer",
+                    "ecr:BatchGetImage",
+                    "logs:CreateLogStream",
+                    "logs:PutLogEvents",
+                  ],
+                  Resource: "*",
+                },
+              ],
+            }),
+          },
+        ],
+        assumeRolePolicy: JSON.stringify({
+          Version: "2012-10-17",
+          Statement: [
+            {
+              Action: "sts:AssumeRole",
+              Effect: "Allow",
+              Sid: "",
+              Principal: {
+                Service: "ecs-tasks.amazonaws.com",
+              },
+            },
+          ],
+        }),
+      });
 
-    const cluster = new EcsCluster(this, "cluster", {
-      name,
-      capacityProviders: ["FARGATE"],
-    });
+      const taskRole = new IamRole(scope, `${name}-task-role`, {
+        name: `task-role`,
+        inlinePolicy: [
+          {
+            name: "allow-logs",
+            policy: JSON.stringify({
+              Version: "2012-10-17",
+              Statement: [
+                {
+                  Effect: "Allow",
+                  Action: ["logs:CreateLogStream", "logs:PutLogEvents"],
+                  Resource: "*",
+                },
+              ],
+            }),
+          },
+        ],
+        assumeRolePolicy: JSON.stringify({
+          Version: "2012-10-17",
+          Statement: [
+            {
+              Action: "sts:AssumeRole",
+              Effect: "Allow",
+              Sid: "",
+              Principal: {
+                Service: "ecs-tasks.amazonaws.com",
+              },
+            },
+          ],
+        }),
+      });
 
-    const vpc = new VPC(this, "vpc", {
-      name,
-      cidr: "10.0.0.0/16",
-      azs: ["a", "b", "c"].map((i) => `${region}${i}`),
-      privateSubnets: ["10.0.1.0/24", "10.0.2.0/24", "10.0.3.0/24"],
-      publicSubnets: ["10.0.101.0/24", "10.0.102.0/24", "10.0.103.0/24"],
-      databaseSubnets: ["10.0.201.0/24", "10.0.202.0/24", "10.0.203.0/24"],
-      createDatabaseSubnetGroup: true,
-      enableNatGateway: true,
-      singleNatGateway: true,
-    });
+      const logGroup = new CloudwatchLogGroup(scope, `${name}-loggroup`, {
+        name: `${cluster.name}/${name}`,
+        retentionInDays: 30,
+      });
 
-    const lbSecurityGroup = new SecurityGroup(this, "lb-security-group", {
+      const task = new EcsTaskDefinition(scope, `${name}-task`, {
+        dependsOn: [image],
+        cpu: "256",
+        memory: "512",
+        requiresCompatibilities: ["FARGATE", "EC2"],
+        networkMode: "awsvpc",
+        executionRoleArn: executionRole.arn,
+        taskRoleArn: taskRole.arn,
+        containerDefinitions: JSON.stringify([
+          {
+            name,
+            image: tag,
+            cpu: 256,
+            memory: 512,
+            environment: Object.entries(env).map(([name, value]) => ({
+              name,
+              value,
+            })),
+            portMappings: [
+              {
+                containerPort: 80,
+                hostPort: 80,
+              },
+            ],
+            logConfiguration: {
+              logDriver: "awslogs",
+              options: {
+                "awslogs-group": logGroup.name,
+                "awslogs-region": "us-east-1",
+                "awslogs-stream-prefix": name,
+              },
+            },
+          },
+        ]),
+        family: "service",
+      });
+
+      return task;
+    },
+  };
+}
+
+function LoadBalancer(
+  scope: Construct,
+  name: string,
+  vpc: VPC,
+  cluster: EcsCluster
+) {
+  const lbSecurityGroup = new SecurityGroup(
+    scope,
+    `${name}-lb-security-group`,
+    {
       vpcId: vpc.vpcIdOutput,
       ingress: [
         {
@@ -387,100 +282,246 @@ class MyStack extends TerraformStack {
           ipv6CidrBlocks: ["::/0"],
         },
       ],
-    });
-    const lb = new Lb(this, "lb", {
-      name,
-      internal: false,
-      loadBalancerType: "application",
-      securityGroups: [lbSecurityGroup.id],
-    });
-    // Due to output being reference to string array
-    lb.addOverride("subnets", vpc.publicSubnetsOutput);
+    }
+  );
+  const lb = new Lb(scope, `${name}-lb`, {
+    name,
+    internal: false,
+    loadBalancerType: "application",
+    securityGroups: [lbSecurityGroup.id],
+  });
+  // Due to output being reference to string array
+  lb.addOverride("subnets", vpc.publicSubnetsOutput);
 
-    const lbl = new LbListener(this, "lb-listener", {
-      loadBalancerArn: lb.arn,
-      port: 80,
-      protocol: "HTTP",
-      defaultAction: [
+  const lbl = new LbListener(scope, `${name}-lb-listener`, {
+    loadBalancerArn: lb.arn,
+    port: 80,
+    protocol: "HTTP",
+    defaultAction: [
+      {
+        type: "fixed-response",
+        fixedResponse: [
+          {
+            contentType: "text/plain",
+            statusCode: "404",
+            messageBody: "Could not find the resource you are looking for",
+          },
+        ],
+      },
+    ],
+  });
+
+  return {
+    lb,
+    exposeService(
+      name: string,
+      task: EcsTaskDefinition,
+      serviceSecurityGroup: SecurityGroup
+    ) {
+      const targetGroup = new LbTargetGroup(scope, `${name}-target-group`, {
+        dependsOn: [lbl],
+        name: `target-group`,
+        port: 80,
+        protocol: "HTTP",
+        targetType: "ip",
+        vpcId: vpc.vpcIdOutput,
+        healthCheck: [
+          {
+            enabled: true,
+            path: "/ready",
+          },
+        ],
+      });
+
+      new LbListenerRule(scope, `${name}-rule`, {
+        listenerArn: lbl.arn,
+        priority: 100,
+
+        action: [
+          {
+            type: "forward",
+            targetGroupArn: targetGroup.arn,
+          },
+        ],
+
+        condition: [
+          {
+            pathPattern: [{ values: ["/*"] }],
+          },
+        ],
+      });
+
+      const service = new EcsService(scope, `${name}-service`, {
+        dependsOn: [lbl],
+        name,
+        launchType: "FARGATE",
+        cluster: cluster.id,
+        desiredCount: 1,
+        taskDefinition: task.arn,
+        networkConfiguration: [
+          {
+            subnets: [],
+            assignPublicIp: true,
+            securityGroups: [serviceSecurityGroup.id],
+          },
+        ],
+        loadBalancer: [
+          {
+            containerPort: 80,
+            containerName: name,
+            targetGroupArn: targetGroup.arn,
+          },
+        ],
+      });
+
+      service.addOverride(
+        "network_configuration.0.subnets",
+        vpc.publicSubnetsOutput
+      );
+    },
+  };
+}
+
+function PublicS3Bucket(
+  scope: Construct,
+  name: string,
+  absoluteContentPath: string
+) {
+  const { path: contentPath, assetHash: contentHash } = new TerraformAsset(
+    scope,
+    `${name}-frontend`,
+    {
+      path: absoluteContentPath,
+    }
+  );
+
+  const bucket = new S3Bucket(scope, `${name}-bucket`, {
+    bucketPrefix: `${name}-frontend`,
+    website: [
+      {
+        indexDocument: "index.html",
+        errorDocument: "index.html",
+      },
+    ],
+    tags: {
+      "hc-internet-facing": "true",
+    },
+  });
+
+  const files = glob("**/*.{json,js,html,png,ico,txt,map,css}", {
+    cwd: absoluteContentPath,
+  });
+
+  files.forEach((f) => {
+    const filePath = path.join(contentPath, f);
+    new S3BucketObject(scope, `${bucket.id}/${f}/${contentHash}`, {
+      bucket: bucket.id,
+      key: f,
+      source: filePath,
+      contentType: mime(path.extname(f)) || "text/html",
+      etag: `filemd5("${filePath}")`,
+    });
+  });
+
+  new S3BucketPolicy(scope, `${name}-s3-policy`, {
+    bucket: bucket.id,
+    policy: JSON.stringify({
+      Version: "2012-10-17",
+      Id: "PolicyForWebsiteEndpointsPublicContent",
+      Statement: [
         {
-          type: "fixed-response",
-          fixedResponse: [
-            {
-              contentType: "text/plain",
-              statusCode: "404",
-              messageBody: "Could not find the resource you are looking for",
-            },
-          ],
+          Sid: "PublicRead",
+          Effect: "Allow",
+          Principal: "*",
+          Action: ["s3:GetObject"],
+          Resource: [`${bucket.arn}/*`, `${bucket.arn}`],
         },
       ],
+    }),
+  });
+
+  return bucket;
+}
+
+// TODO: tag everything
+class MyStack extends TerraformStack {
+  constructor(scope: Construct, name: string) {
+    super(scope, name);
+    const region = "us-east-1";
+
+    new AwsProvider(this, "aws", {
+      region,
+    });
+    new DockerProvider(this, "docker");
+    new NullProvider(this, "provider", {});
+
+    const vpc = new VPC(this, "vpc", {
+      name,
+      cidr: "10.0.0.0/16",
+      azs: ["a", "b", "c"].map((i) => `${region}${i}`),
+      privateSubnets: ["10.0.1.0/24", "10.0.2.0/24", "10.0.3.0/24"],
+      publicSubnets: ["10.0.101.0/24", "10.0.102.0/24", "10.0.103.0/24"],
+      databaseSubnets: ["10.0.201.0/24", "10.0.202.0/24", "10.0.203.0/24"],
+      createDatabaseSubnetGroup: true,
+      enableNatGateway: true,
+      singleNatGateway: true,
     });
 
-    DockerApplication(
+    const cluster = Cluster(this, "cluster");
+    const loadBalancer = LoadBalancer(
       this,
-      "backend",
-      path.resolve(__dirname, "../../application/backend"),
-      cluster,
-      lb,
-      lbl,
-      vpc
+      "loadbalancer",
+      vpc,
+      cluster.cluster
     );
-
-    const absoluteContentPath = path.resolve(
-      __dirname,
-      "../../application/frontend/build"
-    );
-    const { path: contentPath, assetHash: contentHash } = new TerraformAsset(
+    const serviceSecurityGroup = new SecurityGroup(
       this,
-      "frontend",
+      `${name}-service-security-group`,
       {
-        path: absoluteContentPath,
+        vpcId: vpc.vpcIdOutput,
+        ingress: [
+          {
+            protocol: "TCP",
+            fromPort: 80,
+            toPort: 80,
+            securityGroups: loadBalancer.lb.securityGroups,
+          },
+        ],
+        egress: [
+          {
+            fromPort: 0,
+            toPort: 0,
+            protocol: "-1",
+            cidrBlocks: ["0.0.0.0/0"],
+            ipv6CidrBlocks: ["::/0"],
+          },
+        ],
       }
     );
 
-    const bucket = new S3Bucket(this, "bucket", {
-      bucketPrefix: `docker-example-frontend`,
-      website: [
-        {
-          indexDocument: "index.html",
-          errorDocument: "index.html",
-        },
-      ],
-      tags: {
-        "hc-internet-facing": "true",
-      },
-    });
+    const db = PostgresDB(this, "dockerintegration", vpc, serviceSecurityGroup);
 
-    const files = glob("**/*.{json,js,html,png,ico,txt,map,css}", {
-      cwd: absoluteContentPath,
-    });
+    const { image: backendImage, tag: backendTag } = PushedECRImage(
+      this,
+      "backend",
+      path.resolve(__dirname, "../../application/backend")
+    );
 
-    files.forEach((f) => {
-      const filePath = path.join(contentPath, f);
-      new S3BucketObject(this, `${bucket.id}/${f}/${contentHash}`, {
-        bucket: bucket.id,
-        key: f,
-        source: filePath,
-        contentType: mime(path.extname(f)) || "text/html",
-        etag: `filemd5("${filePath}")`,
-      });
+    const task = cluster.runDockerImage("backend", backendTag, backendImage, {
+      PORT: "80",
+      POSTGRES_USER: db.username,
+      POSTGRES_PASSWORD: db.password,
+      POSTGRES_DB: db.name,
+      POSTGRES_HOST: db.dbInstanceAddressOutput,
+      POSTGRES_PORT: db.dbInstancePortOutput,
     });
+    loadBalancer.exposeService("backend", task, serviceSecurityGroup);
 
-    new S3BucketPolicy(this, "s3_policy", {
-      bucket: bucket.id,
-      policy: JSON.stringify({
-        Version: "2012-10-17",
-        Id: "PolicyForWebsiteEndpointsPublicContent",
-        Statement: [
-          {
-            Sid: "PublicRead",
-            Effect: "Allow",
-            Principal: "*",
-            Action: ["s3:GetObject"],
-            Resource: [`${bucket.arn}/*`, `${bucket.arn}`],
-          },
-        ],
-      }),
-    });
+    const bucket = PublicS3Bucket(
+      this,
+      name,
+      path.resolve(__dirname, "../../application/frontend/build")
+    );
 
     const cdn = new CloudfrontDistribution(this, "cf", {
       comment: `Docker example frontend`,
@@ -519,7 +560,7 @@ class MyStack extends TerraformStack {
         },
         {
           originId: "backend", // extract to constant
-          domainName: lb.dnsName,
+          domainName: loadBalancer.lb.dnsName,
           customOriginConfig: [
             {
               originProtocolPolicy: "http-only",
