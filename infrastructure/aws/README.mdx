@@ -1,0 +1,205 @@
+# AWS Docker Integration Example
+
+Did you ever wanted to get a backend service in a Docker container with a static (e.g. React) frontend running on AWS?
+In this example we are going to walk you through how to set everything up in AWS and how to configure the backend to run against a Postgres Database, all using the CDK for Terraform.
+
+First of all we start with `cdktf init --template typescript` to get our project setup started. This gives us a `main.ts` file as entrypoint for our infrastructure definition. To start we first need to configure a Virtual Private Cloud (VPC) to host all of our resources in, most services need to have an association with a VPC.
+
+```ts
+import { TerraformAwsModulesVpcAws as VPC } from "./.gen/modules/terraform-aws-modules/vpc/aws";
+
+class MyStack extends TerraformStack {
+  constructor(scope: Construct, name: string) {
+    super(scope, name);
+    const region = "us-east-1";
+
+    // We need to instanciate all providers we are going to use
+    new AwsProvider(this, "aws", {
+      region,
+    });
+    new DockerProvider(this, "docker");
+    new NullProvider(this, "provider", {});
+
+    const vpc = new VPC(this, "vpc", {
+      // We use the name of the stack
+      name,
+      // We tag every resource with the same set of tags to easily identify the resources
+      tags,
+      cidr: "10.0.0.0/16",
+      // We want to run on three availability zones
+      azs: ["a", "b", "c"].map((i) => `${region}${i}`),
+      // We need three CIDR blocks as we have three availability zones
+      privateSubnets: ["10.0.1.0/24", "10.0.2.0/24", "10.0.3.0/24"],
+      publicSubnets: ["10.0.101.0/24", "10.0.102.0/24", "10.0.103.0/24"],
+      databaseSubnets: ["10.0.201.0/24", "10.0.202.0/24", "10.0.203.0/24"],
+      createDatabaseSubnetGroup: true,
+      enableNatGateway: true,
+      // Using a single NAT Gateway will save us some money, coming with the cost of less redundancy
+      singleNatGateway: true,
+    });
+  }
+}
+
+const app = new App();
+new MyStack(app, "example-docker-aws");
+app.synth();
+```
+
+Now that we have the VPC set up we need to create a ECS Cluster to host our dockerized application in.
+For this we create a nice, reusable abstraction that we can share with others:
+
+```ts
+function Cluster(scope: Construct, name: string) {
+  const cluster = new EcsCluster(scope, name, {
+    name,
+    capacityProviders: ["FARGATE"],
+    tags,
+  });
+
+  return {
+    cluster,
+    // We expose this function to run our task later on
+    runDockerImage(
+      name: string,
+      tag: string,
+      image: Resource,
+      env: Record<string, string | undefined>
+    ) {
+      // Role that allows us to get the Docker image
+      const executionRole = new IamRole(scope, `${name}-execution-role`, {
+        name: `${name}-execution-role`,
+        tags,
+        inlinePolicy: [
+          {
+            name: "allow-ecr-pull",
+            policy: JSON.stringify({
+              Version: "2012-10-17",
+              Statement: [
+                {
+                  Effect: "Allow",
+                  Action: [
+                    "ecr:GetAuthorizationToken",
+                    "ecr:BatchCheckLayerAvailability",
+                    "ecr:GetDownloadUrlForLayer",
+                    "ecr:BatchGetImage",
+                    "logs:CreateLogStream",
+                    "logs:PutLogEvents",
+                  ],
+                  Resource: "*",
+                },
+              ],
+            }),
+          },
+        ],
+        assumeRolePolicy: JSON.stringify({
+          Version: "2012-10-17",
+          Statement: [
+            {
+              Action: "sts:AssumeRole",
+              Effect: "Allow",
+              Sid: "",
+              Principal: {
+                Service: "ecs-tasks.amazonaws.com",
+              },
+            },
+          ],
+        }),
+      });
+
+      // Role that allows us to push logs
+      const taskRole = new IamRole(scope, `${name}-task-role`, {
+        name: `${name}-task-role`,
+        tags,
+        inlinePolicy: [
+          {
+            name: "allow-logs",
+            policy: JSON.stringify({
+              Version: "2012-10-17",
+              Statement: [
+                {
+                  Effect: "Allow",
+                  Action: ["logs:CreateLogStream", "logs:PutLogEvents"],
+                  Resource: "*",
+                },
+              ],
+            }),
+          },
+        ],
+        assumeRolePolicy: JSON.stringify({
+          Version: "2012-10-17",
+          Statement: [
+            {
+              Action: "sts:AssumeRole",
+              Effect: "Allow",
+              Sid: "",
+              Principal: {
+                Service: "ecs-tasks.amazonaws.com",
+              },
+            },
+          ],
+        }),
+      });
+
+      // Creates a log group for the task
+      const logGroup = new CloudwatchLogGroup(scope, `${name}-loggroup`, {
+        name: `${cluster.name}/${name}`,
+        retentionInDays: 30,
+        tags,
+      });
+
+      // Creates a task that runs the docker container
+      const task = new EcsTaskDefinition(scope, `${name}-task`, {
+        // We want to wait until the image is actually pushed
+        dependsOn: [image],
+        tags,
+        // These values are fixed for the example, we can make them part of our function invocation if we want to change them
+        cpu: "256",
+        memory: "512",
+        requiresCompatibilities: ["FARGATE", "EC2"],
+        networkMode: "awsvpc",
+        executionRoleArn: executionRole.arn,
+        taskRoleArn: taskRole.arn,
+        containerDefinitions: JSON.stringify([
+          {
+            name,
+            image: tag,
+            cpu: 256,
+            memory: 512,
+            environment: Object.entries(env).map(([name, value]) => ({
+              name,
+              value,
+            })),
+            portMappings: [
+              {
+                containerPort: 80,
+                hostPort: 80,
+              },
+            ],
+            logConfiguration: {
+              logDriver: "awslogs",
+              options: {
+                // Defines the log group and prefix
+                "awslogs-group": logGroup.name,
+                "awslogs-region": REGION,
+                "awslogs-stream-prefix": name,
+              },
+            },
+          },
+        ]),
+        family: "service",
+      });
+
+      return task;
+    },
+  };
+}
+
+class MyStack extends TerraformStack {
+  constructor(scope: Construct, name: string) {
+    // ...
+    const cluster = Cluster(this, "cluster");
+  }
+}
+```
+
+Our service has some dependencies, it needs a load balancer and a postgres database.
