@@ -30,6 +30,7 @@ import { TerraformAwsModulesRdsAws } from "./.gen/modules/terraform-aws-modules/
 import { Password } from "./.gen/providers/random/password";
 
 const S3_ORIGIN_ID = "s3Origin";
+const REGION = "us-east-1";
 
 const tags = {
   team: "cdk",
@@ -67,196 +68,213 @@ docker push ${tag}
   return { image, tag };
 }
 
-function PostgresDB(
-  scope: Construct,
-  name: string,
-  vpc: VPC,
-  serviceSecurityGroup: SecurityGroup
-) {
-  const password = new Password(scope, `${name}-db-password`, {
-    length: 16,
-    special: false,
-  });
+class PostgresDB extends Resource {
+  public instance: TerraformAwsModulesRdsAws;
 
-  const dbPort = 5432;
+  constructor(
+    scope: Construct,
+    name: string,
+    vpc: VPC,
+    serviceSecurityGroup: SecurityGroup
+  ) {
+    super(scope, name);
 
-  const dbSecurityGroup = new SecurityGroup(scope, "db-security-group", {
-    vpcId: vpc.vpcIdOutput,
-    ingress: [
-      {
-        fromPort: dbPort,
-        toPort: dbPort,
-        protocol: "TCP",
-        securityGroups: [serviceSecurityGroup.id],
-      },
-    ],
-    tags,
-  });
+    const password = new Password(scope, `${name}-db-password`, {
+      length: 16,
+      special: false,
+    });
 
-  const db = new TerraformAwsModulesRdsAws(scope, "db", {
-    identifier: `${name}-db`,
+    const dbPort = 5432;
 
-    engine: "postgres",
-    engineVersion: "11.10",
-    family: "postgres11",
-    instanceClass: "db.t3.micro",
-    allocatedStorage: "5",
+    const dbSecurityGroup = new SecurityGroup(scope, "db-security-group", {
+      vpcId: vpc.vpcIdOutput,
+      ingress: [
+        {
+          fromPort: dbPort,
+          toPort: dbPort,
+          protocol: "TCP",
+          securityGroups: [serviceSecurityGroup.id],
+        },
+      ],
+      tags,
+    });
 
-    createDbOptionGroup: false,
-    createDbParameterGroup: false,
-    applyImmediately: true,
+    const db = new TerraformAwsModulesRdsAws(scope, "db", {
+      identifier: `${name}-db`,
 
-    name,
-    port: String(dbPort),
-    username: `${name}user`,
-    password: password.result,
+      engine: "postgres",
+      engineVersion: "11.10",
+      family: "postgres11",
+      instanceClass: "db.t3.micro",
+      allocatedStorage: "5",
 
-    maintenanceWindow: "Mon:00:00-Mon:03:00",
-    backupWindow: "03:00-06:00",
+      createDbOptionGroup: false,
+      createDbParameterGroup: false,
+      applyImmediately: true,
 
-    subnetIds: vpc.databaseSubnetsOutput as unknown as any, // 🙈
-    vpcSecurityGroupIds: [dbSecurityGroup.id],
-    tags,
-  });
+      name,
+      port: String(dbPort),
+      username: `${name}user`,
+      password: password.result,
 
-  return db;
+      maintenanceWindow: "Mon:00:00-Mon:03:00",
+      backupWindow: "03:00-06:00",
+
+      subnetIds: vpc.databaseSubnetsOutput as unknown as any, // 🙈
+      vpcSecurityGroupIds: [dbSecurityGroup.id],
+      tags,
+    });
+
+    this.instance = db;
+  }
 }
 
-function Cluster(scope: Construct, name: string) {
-  const cluster = new EcsCluster(scope, name, {
-    name,
-    capacityProviders: ["FARGATE"],
-    tags,
-  });
+class Cluster extends Resource {
+  public cluster: EcsCluster;
+  constructor(scope: Construct, clusterName: string) {
+    super(scope, clusterName);
 
-  return {
-    cluster,
-    runDockerImage(
-      name: string,
-      tag: string,
-      image: Resource,
-      env: Record<string, string | undefined>
-    ) {
-      const executionRole = new IamRole(scope, `${name}-execution-role`, {
-        name: `execution-role`,
-        tags,
-        inlinePolicy: [
-          {
-            name: "allow-ecr-pull",
-            policy: JSON.stringify({
-              Version: "2012-10-17",
-              Statement: [
-                {
-                  Effect: "Allow",
-                  Action: [
-                    "ecr:GetAuthorizationToken",
-                    "ecr:BatchCheckLayerAvailability",
-                    "ecr:GetDownloadUrlForLayer",
-                    "ecr:BatchGetImage",
-                    "logs:CreateLogStream",
-                    "logs:PutLogEvents",
-                  ],
-                  Resource: "*",
-                },
-              ],
-            }),
-          },
-        ],
-        assumeRolePolicy: JSON.stringify({
-          Version: "2012-10-17",
-          Statement: [
-            {
-              Action: "sts:AssumeRole",
-              Effect: "Allow",
-              Sid: "",
-              Principal: {
-                Service: "ecs-tasks.amazonaws.com",
-              },
-            },
-          ],
-        }),
-      });
+    const cluster = new EcsCluster(scope, `ecs-${clusterName}`, {
+      name: clusterName,
+      capacityProviders: ["FARGATE"],
+      tags,
+    });
 
-      const taskRole = new IamRole(scope, `${name}-task-role`, {
-        name: `task-role`,
-        tags,
-        inlinePolicy: [
-          {
-            name: "allow-logs",
-            policy: JSON.stringify({
-              Version: "2012-10-17",
-              Statement: [
-                {
-                  Effect: "Allow",
-                  Action: ["logs:CreateLogStream", "logs:PutLogEvents"],
-                  Resource: "*",
-                },
-              ],
-            }),
-          },
-        ],
-        assumeRolePolicy: JSON.stringify({
-          Version: "2012-10-17",
-          Statement: [
-            {
-              Action: "sts:AssumeRole",
-              Effect: "Allow",
-              Sid: "",
-              Principal: {
-                Service: "ecs-tasks.amazonaws.com",
-              },
-            },
-          ],
-        }),
-      });
+    this.cluster = cluster;
+  }
 
-      const logGroup = new CloudwatchLogGroup(scope, `${name}-loggroup`, {
-        name: `${cluster.name}/${name}`,
-        retentionInDays: 30,
-        tags,
-      });
-
-      const task = new EcsTaskDefinition(scope, `${name}-task`, {
-        dependsOn: [image],
-        tags,
-        cpu: "256",
-        memory: "512",
-        requiresCompatibilities: ["FARGATE", "EC2"],
-        networkMode: "awsvpc",
-        executionRoleArn: executionRole.arn,
-        taskRoleArn: taskRole.arn,
-        containerDefinitions: JSON.stringify([
-          {
-            name,
-            image: tag,
-            cpu: 256,
-            memory: 512,
-            environment: Object.entries(env).map(([name, value]) => ({
-              name,
-              value,
-            })),
-            portMappings: [
+  public runDockerImage(
+    name: string,
+    tag: string,
+    image: Resource,
+    env: Record<string, string | undefined>
+  ) {
+    // Role that allows us to get the Docker image
+    const executionRole = new IamRole(this, `${name}-execution-role`, {
+      name: `${name}-execution-role`,
+      tags,
+      inlinePolicy: [
+        {
+          name: "allow-ecr-pull",
+          policy: JSON.stringify({
+            Version: "2012-10-17",
+            Statement: [
               {
-                containerPort: 80,
-                hostPort: 80,
+                Effect: "Allow",
+                Action: [
+                  "ecr:GetAuthorizationToken",
+                  "ecr:BatchCheckLayerAvailability",
+                  "ecr:GetDownloadUrlForLayer",
+                  "ecr:BatchGetImage",
+                  "logs:CreateLogStream",
+                  "logs:PutLogEvents",
+                ],
+                Resource: "*",
               },
             ],
-            logConfiguration: {
-              logDriver: "awslogs",
-              options: {
-                "awslogs-group": logGroup.name,
-                "awslogs-region": "us-east-1",
-                "awslogs-stream-prefix": name,
-              },
+          }),
+        },
+      ],
+      assumeRolePolicy: JSON.stringify({
+        Version: "2012-10-17",
+        Statement: [
+          {
+            Action: "sts:AssumeRole",
+            Effect: "Allow",
+            Sid: "",
+            Principal: {
+              Service: "ecs-tasks.amazonaws.com",
             },
           },
-        ]),
-        family: "service",
-      });
+        ],
+      }),
+    });
 
-      return task;
-    },
-  };
+    // Role that allows us to push logs
+    const taskRole = new IamRole(this, `${name}-task-role`, {
+      name: `${name}-task-role`,
+      tags,
+      inlinePolicy: [
+        {
+          name: "allow-logs",
+          policy: JSON.stringify({
+            Version: "2012-10-17",
+            Statement: [
+              {
+                Effect: "Allow",
+                Action: ["logs:CreateLogStream", "logs:PutLogEvents"],
+                Resource: "*",
+              },
+            ],
+          }),
+        },
+      ],
+      assumeRolePolicy: JSON.stringify({
+        Version: "2012-10-17",
+        Statement: [
+          {
+            Action: "sts:AssumeRole",
+            Effect: "Allow",
+            Sid: "",
+            Principal: {
+              Service: "ecs-tasks.amazonaws.com",
+            },
+          },
+        ],
+      }),
+    });
+
+    // Creates a log group for the task
+    const logGroup = new CloudwatchLogGroup(this, `${name}-loggroup`, {
+      name: `${this.cluster.name}/${name}`,
+      retentionInDays: 30,
+      tags,
+    });
+
+    // Creates a task that runs the docker container
+    const task = new EcsTaskDefinition(this, `${name}-task`, {
+      // We want to wait until the image is actually pushed
+      dependsOn: [image],
+      tags,
+      // These values are fixed for the example, we can make them part of our function invocation if we want to change them
+      cpu: "256",
+      memory: "512",
+      requiresCompatibilities: ["FARGATE", "EC2"],
+      networkMode: "awsvpc",
+      executionRoleArn: executionRole.arn,
+      taskRoleArn: taskRole.arn,
+      containerDefinitions: JSON.stringify([
+        {
+          name,
+          image: tag,
+          cpu: 256,
+          memory: 512,
+          environment: Object.entries(env).map(([name, value]) => ({
+            name,
+            value,
+          })),
+          portMappings: [
+            {
+              containerPort: 80,
+              hostPort: 80,
+            },
+          ],
+          logConfiguration: {
+            logDriver: "awslogs",
+            options: {
+              // Defines the log
+              "awslogs-group": logGroup.name,
+              "awslogs-region": REGION,
+              "awslogs-stream-prefix": name,
+            },
+          },
+        },
+      ]),
+      family: "service",
+    });
+
+    return task;
+  }
 }
 
 function LoadBalancer(
@@ -468,10 +486,9 @@ function PublicS3Bucket(
 class MyStack extends TerraformStack {
   constructor(scope: Construct, name: string) {
     super(scope, name);
-    const region = "us-east-1";
 
     new AwsProvider(this, "aws", {
-      region,
+      region: REGION,
     });
     new DockerProvider(this, "docker");
     new NullProvider(this, "provider", {});
@@ -480,7 +497,7 @@ class MyStack extends TerraformStack {
       name,
       tags,
       cidr: "10.0.0.0/16",
-      azs: ["a", "b", "c"].map((i) => `${region}${i}`),
+      azs: ["a", "b", "c"].map((i) => `${REGION}${i}`),
       privateSubnets: ["10.0.1.0/24", "10.0.2.0/24", "10.0.3.0/24"],
       publicSubnets: ["10.0.101.0/24", "10.0.102.0/24", "10.0.103.0/24"],
       databaseSubnets: ["10.0.201.0/24", "10.0.202.0/24", "10.0.203.0/24"],
@@ -489,7 +506,7 @@ class MyStack extends TerraformStack {
       singleNatGateway: true,
     });
 
-    const cluster = Cluster(this, "cluster");
+    const cluster = new Cluster(this, "cluster");
     const loadBalancer = LoadBalancer(
       this,
       "loadbalancer",
@@ -522,7 +539,12 @@ class MyStack extends TerraformStack {
       }
     );
 
-    const db = PostgresDB(this, "dockerintegration", vpc, serviceSecurityGroup);
+    const db = new PostgresDB(
+      this,
+      "dockerintegration",
+      vpc,
+      serviceSecurityGroup
+    );
 
     const { image: backendImage, tag: backendTag } = PushedECRImage(
       this,
@@ -532,11 +554,11 @@ class MyStack extends TerraformStack {
 
     const task = cluster.runDockerImage("backend", backendTag, backendImage, {
       PORT: "80",
-      POSTGRES_USER: db.username,
-      POSTGRES_PASSWORD: db.password,
-      POSTGRES_DB: db.name,
-      POSTGRES_HOST: db.dbInstanceAddressOutput,
-      POSTGRES_PORT: db.dbInstancePortOutput,
+      POSTGRES_USER: db.instance.username,
+      POSTGRES_PASSWORD: db.instance.password,
+      POSTGRES_DB: db.instance.name,
+      POSTGRES_HOST: db.instance.dbInstanceAddressOutput,
+      POSTGRES_PORT: db.instance.dbInstancePortOutput,
     });
     loadBalancer.exposeService("backend", task, serviceSecurityGroup);
 
@@ -609,7 +631,9 @@ class MyStack extends TerraformStack {
           cachedMethods: ["HEAD", "GET"],
           pathPattern: "/backend/*",
           targetOriginId: "backend",
+          minTtl: 0,
           defaultTtl: 10,
+          maxTtl: 50,
           viewerProtocolPolicy: "redirect-to-https",
           forwardedValues: [
             {
