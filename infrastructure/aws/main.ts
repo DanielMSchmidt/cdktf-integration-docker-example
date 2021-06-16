@@ -79,16 +79,18 @@ class PostgresDB extends Resource {
   ) {
     super(scope, name);
 
-    const password = new Password(scope, `${name}-db-password`, {
+    // Create a password stored in the TF State on the fly
+    const password = new Password(this, `${name}-db-password`, {
       length: 16,
       special: false,
     });
 
     const dbPort = 5432;
 
-    const dbSecurityGroup = new SecurityGroup(scope, "db-security-group", {
+    const dbSecurityGroup = new SecurityGroup(this, "db-security-group", {
       vpcId: vpc.vpcIdOutput,
       ingress: [
+        // allow traffic to the DBs port from the service
         {
           fromPort: dbPort,
           toPort: dbPort,
@@ -99,7 +101,8 @@ class PostgresDB extends Resource {
       tags,
     });
 
-    const db = new TerraformAwsModulesRdsAws(scope, "db", {
+    // Using this module: https://registry.terraform.io/modules/terraform-aws-modules/rds/aws/latest
+    const db = new TerraformAwsModulesRdsAws(this, "db", {
       identifier: `${name}-db`,
 
       engine: "postgres",
@@ -120,7 +123,9 @@ class PostgresDB extends Resource {
       maintenanceWindow: "Mon:00:00-Mon:03:00",
       backupWindow: "03:00-06:00",
 
-      subnetIds: vpc.databaseSubnetsOutput as unknown as any, // 🙈
+      // This is necessary due to a shortcoming in our token system to be adressed in
+      // https://github.com/hashicorp/terraform-cdk/issues/651
+      subnetIds: vpc.databaseSubnetsOutput as unknown as any,
       vpcSecurityGroupIds: [dbSecurityGroup.id],
       tags,
     });
@@ -134,7 +139,7 @@ class Cluster extends Resource {
   constructor(scope: Construct, clusterName: string) {
     super(scope, clusterName);
 
-    const cluster = new EcsCluster(scope, `ecs-${clusterName}`, {
+    const cluster = new EcsCluster(this, `ecs-${clusterName}`, {
       name: clusterName,
       capacityProviders: ["FARGATE"],
       tags,
@@ -277,145 +282,149 @@ class Cluster extends Resource {
   }
 }
 
-function LoadBalancer(
-  scope: Construct,
-  name: string,
-  vpc: VPC,
-  cluster: EcsCluster
-) {
-  const lbSecurityGroup = new SecurityGroup(
-    scope,
-    `${name}-lb-security-group`,
-    {
-      vpcId: vpc.vpcIdOutput,
-      tags,
-      ingress: [
-        {
-          protocol: "TCP",
-          fromPort: 80,
-          toPort: 80,
-          cidrBlocks: ["0.0.0.0/0"],
-          ipv6CidrBlocks: ["::/0"],
-        },
-        {
-          protocol: "TCP",
-          fromPort: 443,
-          toPort: 443,
-          cidrBlocks: ["0.0.0.0/0"],
-          ipv6CidrBlocks: ["::/0"],
-        },
-      ],
-      egress: [
-        {
-          fromPort: 0,
-          toPort: 0,
-          protocol: "-1",
-          cidrBlocks: ["0.0.0.0/0"],
-          ipv6CidrBlocks: ["::/0"],
-        },
-      ],
-    }
-  );
-  const lb = new Lb(scope, `${name}-lb`, {
-    name,
-    tags,
-    internal: false,
-    loadBalancerType: "application",
-    securityGroups: [lbSecurityGroup.id],
-  });
-  // Due to output being reference to string array
-  lb.addOverride("subnets", vpc.publicSubnetsOutput);
+class LoadBalancer extends Resource {
+  lb: Lb;
+  lbl: LbListener;
+  vpc: VPC;
+  cluster: EcsCluster;
 
-  const lbl = new LbListener(scope, `${name}-lb-listener`, {
-    loadBalancerArn: lb.arn,
-    port: 80,
-    protocol: "HTTP",
-    tags,
-    defaultAction: [
+  constructor(scope: Construct, name: string, vpc: VPC, cluster: EcsCluster) {
+    super(scope, name);
+    this.vpc = vpc;
+    this.cluster = cluster;
+
+    const lbSecurityGroup = new SecurityGroup(
+      this,
+      `${name}-lb-security-group`,
       {
-        type: "fixed-response",
-        fixedResponse: [
-          {
-            contentType: "text/plain",
-            statusCode: "404",
-            messageBody: "Could not find the resource you are looking for",
-          },
-        ],
-      },
-    ],
-  });
-
-  return {
-    lb,
-    exposeService(
-      name: string,
-      task: EcsTaskDefinition,
-      serviceSecurityGroup: SecurityGroup
-    ) {
-      const targetGroup = new LbTargetGroup(scope, `${name}-target-group`, {
-        dependsOn: [lbl],
-        tags,
-        name: `target-group`,
-        port: 80,
-        protocol: "HTTP",
-        targetType: "ip",
         vpcId: vpc.vpcIdOutput,
-        healthCheck: [
-          {
-            enabled: true,
-            path: "/ready",
-          },
-        ],
-      });
-
-      new LbListenerRule(scope, `${name}-rule`, {
-        listenerArn: lbl.arn,
-        priority: 100,
         tags,
-        action: [
+        ingress: [
+          // allow HTTP traffic from everywhere
           {
-            type: "forward",
-            targetGroupArn: targetGroup.arn,
+            protocol: "TCP",
+            fromPort: 80,
+            toPort: 80,
+            cidrBlocks: ["0.0.0.0/0"],
+            ipv6CidrBlocks: ["::/0"],
           },
         ],
+        egress: [
+          // allow all traffic to every destination
+          {
+            fromPort: 0,
+            toPort: 0,
+            protocol: "-1",
+            cidrBlocks: ["0.0.0.0/0"],
+            ipv6CidrBlocks: ["::/0"],
+          },
+        ],
+      }
+    );
+    this.lb = new Lb(this, `${name}-lb`, {
+      name,
+      tags,
+      // we want this to be our public load balancer so that cloudfront can access it
+      internal: false,
+      loadBalancerType: "application",
+      securityGroups: [lbSecurityGroup.id],
+    });
 
-        condition: [
-          {
-            pathPattern: [{ values: ["/*"] }],
-          },
-        ],
-      });
+    // This is necessary due to a shortcoming in our token system to be adressed in
+    // https://github.com/hashicorp/terraform-cdk/issues/651
+    this.lb.addOverride("subnets", vpc.publicSubnetsOutput);
 
-      const service = new EcsService(scope, `${name}-service`, {
-        dependsOn: [lbl],
-        tags,
-        name,
-        launchType: "FARGATE",
-        cluster: cluster.id,
-        desiredCount: 1,
-        taskDefinition: task.arn,
-        networkConfiguration: [
-          {
-            subnets: [],
-            assignPublicIp: true,
-            securityGroups: [serviceSecurityGroup.id],
-          },
-        ],
-        loadBalancer: [
-          {
-            containerPort: 80,
-            containerName: name,
-            targetGroupArn: targetGroup.arn,
-          },
-        ],
-      });
+    this.lbl = new LbListener(this, `${name}-lb-listener`, {
+      loadBalancerArn: this.lb.arn,
+      port: 80,
+      protocol: "HTTP",
+      tags,
+      defaultAction: [
+        // We define a fixed 404 message, just in case
+        {
+          type: "fixed-response",
+          fixedResponse: [
+            {
+              contentType: "text/plain",
+              statusCode: "404",
+              messageBody: "Could not find the resource you are looking for",
+            },
+          ],
+        },
+      ],
+    });
+  }
 
-      service.addOverride(
-        "network_configuration.0.subnets",
-        vpc.publicSubnetsOutput
-      );
-    },
-  };
+  exposeService(
+    name: string,
+    task: EcsTaskDefinition,
+    serviceSecurityGroup: SecurityGroup
+  ) {
+    const targetGroup = new LbTargetGroup(this, `${name}-target-group`, {
+      dependsOn: [this.lbl],
+      tags,
+      name: `target-group`,
+      port: 80,
+      protocol: "HTTP",
+      targetType: "ip",
+      vpcId: this.vpc.vpcIdOutput,
+      healthCheck: [
+        {
+          enabled: true,
+          path: "/ready",
+        },
+      ],
+    });
+
+    new LbListenerRule(this, `${name}-rule`, {
+      listenerArn: this.lbl.arn,
+      priority: 100,
+      tags,
+      action: [
+        {
+          type: "forward",
+          targetGroupArn: targetGroup.arn,
+        },
+      ],
+
+      condition: [
+        {
+          pathPattern: [{ values: ["/*"] }],
+        },
+      ],
+    });
+
+    const service = new EcsService(this, `${name}-service`, {
+      dependsOn: [this.lbl],
+      tags,
+      name,
+      launchType: "FARGATE",
+      cluster: this.cluster.id,
+      desiredCount: 1,
+      taskDefinition: task.arn,
+      networkConfiguration: [
+        {
+          subnets: [],
+          assignPublicIp: true,
+          securityGroups: [serviceSecurityGroup.id],
+        },
+      ],
+      loadBalancer: [
+        {
+          containerPort: 80,
+          containerName: name,
+          targetGroupArn: targetGroup.arn,
+        },
+      ],
+    });
+
+    // This is necessary due to a shortcoming in our token system to be adressed in
+    // https://github.com/hashicorp/terraform-cdk/issues/651
+    service.addOverride(
+      "network_configuration.0.subnets",
+      this.vpc.publicSubnetsOutput
+    );
+  }
 }
 
 function PublicS3Bucket(
@@ -507,7 +516,7 @@ class MyStack extends TerraformStack {
     });
 
     const cluster = new Cluster(this, "cluster");
-    const loadBalancer = LoadBalancer(
+    const loadBalancer = new LoadBalancer(
       this,
       "loadbalancer",
       vpc,
@@ -520,6 +529,7 @@ class MyStack extends TerraformStack {
         vpcId: vpc.vpcIdOutput,
         tags,
         ingress: [
+          // only allow incoming traffic from our load balancer
           {
             protocol: "TCP",
             fromPort: 80,
@@ -528,6 +538,7 @@ class MyStack extends TerraformStack {
           },
         ],
         egress: [
+          // allow all outgoing traffic
           {
             fromPort: 0,
             toPort: 0,

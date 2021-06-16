@@ -203,3 +203,234 @@ class MyStack extends TerraformStack {
 ```
 
 Our service has some dependencies, it needs a load balancer and a postgres database.
+The service also needs a security group to run in and that security group needs to allow access to the load balancer and to the database.
+We start by creating a Load Balancer:
+
+```ts
+class LoadBalancer extends Resource {
+  lb: Lb;
+  lbl: LbListener;
+  vpc: VPC;
+  cluster: EcsCluster;
+
+  constructor(scope: Construct, name: string, vpc: VPC, cluster: EcsCluster) {
+    super(scope, name);
+    this.vpc = vpc;
+    this.cluster = cluster;
+
+    const lbSecurityGroup = new SecurityGroup(
+      scope,
+      `${name}-lb-security-group`,
+      {
+        vpcId: vpc.vpcIdOutput,
+        tags,
+        ingress: [
+          // allow HTTP traffic from everywhere
+          {
+            protocol: "TCP",
+            fromPort: 80,
+            toPort: 80,
+            cidrBlocks: ["0.0.0.0/0"],
+            ipv6CidrBlocks: ["::/0"],
+          },
+        ],
+        egress: [
+          // allow all traffic to every destination
+          {
+            fromPort: 0,
+            toPort: 0,
+            protocol: "-1",
+            cidrBlocks: ["0.0.0.0/0"],
+            ipv6CidrBlocks: ["::/0"],
+          },
+        ],
+      }
+    );
+    this.lb = new Lb(scope, `${name}-lb`, {
+      name,
+      tags,
+      // we want this to be our public load balancer so that cloudfront can access it
+      internal: false,
+      loadBalancerType: "application",
+      securityGroups: [lbSecurityGroup.id],
+    });
+
+    // This is necessary due to a shortcoming in our token system to be adressed in
+    // https://github.com/hashicorp/terraform-cdk/issues/651
+    this.lb.addOverride("subnets", vpc.publicSubnetsOutput);
+
+    this.lbl = new LbListener(scope, `${name}-lb-listener`, {
+      loadBalancerArn: this.lb.arn,
+      port: 80,
+      protocol: "HTTP",
+      tags,
+      defaultAction: [
+        // We define a fixed 404 message, just in case
+        {
+          type: "fixed-response",
+          fixedResponse: [
+            {
+              contentType: "text/plain",
+              statusCode: "404",
+              messageBody: "Could not find the resource you are looking for",
+            },
+          ],
+        },
+      ],
+    });
+  }
+
+  exposeService(
+    name: string,
+    task: EcsTaskDefinition,
+    serviceSecurityGroup: SecurityGroup
+  ) {
+    // we will discuss this later on
+  }
+}
+
+class MyStack extends TerraformStack {
+  constructor(scope: Construct, name: string) {
+    // ...
+    const loadBalancer = new LoadBalancer(
+      this,
+      "loadbalancer",
+      vpc,
+      cluster.cluster
+    );
+  }
+}
+```
+
+The `LoadBalancer` resource creates a `SecurityGroup` that allows the Load Balancer to receive traffic on port 80 and send traffic to any destination.
+We then create a `Lb` resource, which builds an Application Load Balancer (ALB) for us.
+To receive traffic we create a Load Balancer Listener for port 80. We don't expose port 443 currently, as SSL is handled by CloudFront later on.
+If we wanted to expose the `Lb` directly on the internet we would change the port to 443 and the protocol to HTTPS while creating a valid certificate.
+
+To see something in case our backend service is not responding we create a defaultAction that returns a static text.
+We use a `SecurityGroup` to allow our load balancer to access the service:
+
+```ts
+class MyStack extends TerraformStack {
+  constructor(scope: Construct, name: string) {
+    // ...
+    const serviceSecurityGroup = new SecurityGroup(
+      this,
+      `${name}-service-security-group`,
+      {
+        vpcId: vpc.vpcIdOutput,
+        tags,
+        ingress: [
+          // only allow incoming traffic from our load balancer
+          {
+            protocol: "TCP",
+            fromPort: 80,
+            toPort: 80,
+            securityGroups: loadBalancer.lb.securityGroups,
+          },
+        ],
+        egress: [
+          // allow all outgoing traffic
+          {
+            fromPort: 0,
+            toPort: 0,
+            protocol: "-1",
+            cidrBlocks: ["0.0.0.0/0"],
+            ipv6CidrBlocks: ["::/0"],
+          },
+        ],
+      }
+    );
+  }
+}
+```
+
+Now we can use this security group to allow the postgres instance to receive traffic from our service:
+
+```ts
+class PostgresDB extends Resource {
+  public instance: TerraformAwsModulesRdsAws;
+
+  constructor(
+    scope: Construct,
+    name: string,
+    vpc: VPC,
+    serviceSecurityGroup: SecurityGroup
+  ) {
+    super(scope, name);
+
+    // Create a password stored in the TF State on the fly
+    const password = new Password(scope, `${name}-db-password`, {
+      length: 16,
+      special: false,
+    });
+
+    const dbPort = 5432;
+
+    const dbSecurityGroup = new SecurityGroup(scope, "db-security-group", {
+      vpcId: vpc.vpcIdOutput,
+      ingress: [
+        // allow traffic to the DBs port from the service
+        {
+          fromPort: dbPort,
+          toPort: dbPort,
+          protocol: "TCP",
+          securityGroups: [serviceSecurityGroup.id],
+        },
+      ],
+      tags,
+    });
+
+    // Using this module: https://registry.terraform.io/modules/terraform-aws-modules/rds/aws/latest
+    const db = new TerraformAwsModulesRdsAws(scope, "db", {
+      identifier: `${name}-db`,
+
+      engine: "postgres",
+      engineVersion: "11.10",
+      family: "postgres11",
+      instanceClass: "db.t3.micro",
+      allocatedStorage: "5",
+
+      createDbOptionGroup: false,
+      createDbParameterGroup: false,
+      applyImmediately: true,
+
+      name,
+      port: String(dbPort),
+      username: `${name}user`,
+      password: password.result,
+
+      maintenanceWindow: "Mon:00:00-Mon:03:00",
+      backupWindow: "03:00-06:00",
+
+      // This is necessary due to a shortcoming in our token system to be adressed in
+      // https://github.com/hashicorp/terraform-cdk/issues/651
+      subnetIds: vpc.databaseSubnetsOutput as unknown as any,
+      vpcSecurityGroupIds: [dbSecurityGroup.id],
+      tags,
+    });
+
+    this.instance = db;
+  }
+}
+
+class MyStack extends TerraformStack {
+  constructor(scope: Construct, name: string) {
+    // ...
+    const db = new PostgresDB(
+      this,
+      "dockerintegration",
+      vpc,
+      serviceSecurityGroup
+    );
+  }
+}
+```
+
+We create a security group restricted to our service to secure that only our service can talk to the database.
+By using the [AWS RDS Terraform module](https://registry.terraform.io/modules/terraform-aws-modules/rds/aws/latest) we can
+leverage all the knowledge that went into creating this module and get our Postgres instance.
+
+To deploy the ECS Task we first need to have a docker image pushed. It's up to you if you want to push and deploy it with the CDK or if you want to separate your deployment pipeline from your infrastructure. To me, having everything in one go feels easier and more integrated with the cost that the state gets a bit bigger. So let's see how it can be done within the CDK:
+
+TODO: recopy all examples with classes / scope was changed to this
