@@ -30,6 +30,7 @@ import { TerraformAwsModulesRdsAws } from "./.gen/modules/terraform-aws-modules/
 import { Password } from "./.gen/providers/random/password";
 
 const S3_ORIGIN_ID = "s3Origin";
+const BACKEND_ORIGIN_ID = "backendOrigin";
 const REGION = "us-east-1";
 
 const tags = {
@@ -37,7 +38,7 @@ const tags = {
   owner: "dschmidt",
 };
 
-function PushedECRImage(scope: Construct, name: string, imagePath: string) {
+function PushedECRImage(scope: Construct, name: string, projectPath: string) {
   const repo = new EcrRepository(scope, `${name}-ecr`, {
     name,
     tags,
@@ -49,10 +50,10 @@ function PushedECRImage(scope: Construct, name: string, imagePath: string) {
   });
 
   const asset = new TerraformAsset(scope, `${name}-project`, {
-    path: imagePath,
+    path: projectPath,
   });
 
-  const version = require(`${imagePath}/package.json`).version;
+  const version = require(`${projectPath}/package.json`).version;
   const tag = `${repo.repositoryUrl}:${version}-${asset.assetHash}`;
   // Workaround due to https://github.com/kreuzwerker/terraform-provider-docker/issues/189
   const image = new Resource(scope, `${name}-image-${tag}`, {});
@@ -180,6 +181,7 @@ class Cluster extends Resource {
           }),
         },
       ],
+      // this role shall only be used by an ECS task
       assumeRolePolicy: JSON.stringify({
         Version: "2012-10-17",
         Statement: [
@@ -358,12 +360,14 @@ class LoadBalancer extends Resource {
   exposeService(
     name: string,
     task: EcsTaskDefinition,
-    serviceSecurityGroup: SecurityGroup
+    serviceSecurityGroup: SecurityGroup,
+    path: string
   ) {
+    // Define Load Balancer target group with a health check on /ready
     const targetGroup = new LbTargetGroup(this, `${name}-target-group`, {
       dependsOn: [this.lbl],
       tags,
-      name: `target-group`,
+      name: `${name}-target-group`,
       port: 80,
       protocol: "HTTP",
       targetType: "ip",
@@ -376,6 +380,7 @@ class LoadBalancer extends Resource {
       ],
     });
 
+    // Makes the listener forward requests from subpath to the target group
     new LbListenerRule(this, `${name}-rule`, {
       listenerArn: this.lbl.arn,
       priority: 100,
@@ -389,11 +394,12 @@ class LoadBalancer extends Resource {
 
       condition: [
         {
-          pathPattern: [{ values: ["/*"] }],
+          pathPattern: [{ values: [`${path}*`] }],
         },
       ],
     });
 
+    // Ensure the task is running and wired to the target group, within the right security group
     const service = new EcsService(this, `${name}-service`, {
       dependsOn: [this.lbl],
       tags,
@@ -432,6 +438,7 @@ function PublicS3Bucket(
   name: string,
   absoluteContentPath: string
 ) {
+  // Get built frontend into the terraform context
   const { path: contentPath, assetHash: contentHash } = new TerraformAsset(
     scope,
     `${name}-frontend`,
@@ -440,42 +447,49 @@ function PublicS3Bucket(
     }
   );
 
+  // create bucket with website delivery enabled
   const bucket = new S3Bucket(scope, `${name}-bucket`, {
     bucketPrefix: `${name}-frontend`,
 
     website: [
       {
         indexDocument: "index.html",
-        errorDocument: "index.html",
+        errorDocument: "index.html", // we could put a static error page here
       },
     ],
     tags: {
       ...tags,
-      "hc-internet-facing": "true",
+      "hc-internet-facing": "true", // this is only needed for HashiCorp internal security auditing
     },
   });
 
+  // Get all build files synchronously
   const files = glob("**/*.{json,js,html,png,ico,txt,map,css}", {
     cwd: absoluteContentPath,
   });
 
   files.forEach((f) => {
+    // Construct the local path to the file
     const filePath = path.join(contentPath, f);
+
+    // Creates all the files in the bucket
     new S3BucketObject(scope, `${bucket.id}/${f}/${contentHash}`, {
       bucket: bucket.id,
       tags,
       key: f,
       source: filePath,
+      // mime is an open source node.js tool to get mime types per extension
       contentType: mime(path.extname(f)) || "text/html",
       etag: `filemd5("${filePath}")`,
     });
   });
 
+  // allow read access to all elements within the S3Bucket
   new S3BucketPolicy(scope, `${name}-s3-policy`, {
     bucket: bucket.id,
     policy: JSON.stringify({
       Version: "2012-10-17",
-      Id: "PolicyForWebsiteEndpointsPublicContent",
+      Id: `${name}-public-website`,
       Statement: [
         {
           Sid: "PublicRead",
@@ -571,7 +585,7 @@ class MyStack extends TerraformStack {
       POSTGRES_HOST: db.instance.dbInstanceAddressOutput,
       POSTGRES_PORT: db.instance.dbInstancePortOutput,
     });
-    loadBalancer.exposeService("backend", task, serviceSecurityGroup);
+    loadBalancer.exposeService("backend", task, serviceSecurityGroup, "/backend");
 
     const bucket = PublicS3Bucket(
       this,
@@ -585,6 +599,7 @@ class MyStack extends TerraformStack {
       enabled: true,
       defaultCacheBehavior: [
         {
+          // Allow every method as we want to also serve the backend through this
           allowedMethods: [
             "DELETE",
             "GET",
@@ -596,19 +611,20 @@ class MyStack extends TerraformStack {
           ],
           cachedMethods: ["GET", "HEAD"],
           targetOriginId: S3_ORIGIN_ID,
-          viewerProtocolPolicy: "redirect-to-https",
+          viewerProtocolPolicy: "redirect-to-https", // ensure we serve https
           forwardedValues: [
             { queryString: false, cookies: [{ forward: "none" }] },
           ],
         },
       ],
+      // origins describe different entities that can serve traffic
       origin: [
         {
-          originId: S3_ORIGIN_ID,
-          domainName: bucket.websiteEndpoint,
+          originId: S3_ORIGIN_ID, // origin ids can be freely chosen
+          domainName: bucket.websiteEndpoint, // we serve the website hosted by S3 here
           customOriginConfig: [
             {
-              originProtocolPolicy: "http-only",
+              originProtocolPolicy: "http-only", // the CDN terminates the SSL connection, we can use http internally
               httpPort: 80,
               httpsPort: 443,
               originSslProtocols: ["TLSv1.2", "TLSv1.1", "TLSv1"],
@@ -616,8 +632,8 @@ class MyStack extends TerraformStack {
           ],
         },
         {
-          originId: "backend", // extract to constant
-          domainName: loadBalancer.lb.dnsName,
+          originId: BACKEND_ORIGIN_ID,
+          domainName: loadBalancer.lb.dnsName, // our backend is served by the load balancer
           customOriginConfig: [
             {
               originProtocolPolicy: "http-only",
@@ -628,6 +644,7 @@ class MyStack extends TerraformStack {
           ],
         },
       ],
+      // We define everything that should not be served by the default here
       orderedCacheBehavior: [
         {
           allowedMethods: [
@@ -640,12 +657,14 @@ class MyStack extends TerraformStack {
             "PATCH",
           ],
           cachedMethods: ["HEAD", "GET"],
-          pathPattern: "/backend/*",
-          targetOriginId: "backend",
+          pathPattern: "/backend/*", // our backend should be served under /backend
+          targetOriginId: BACKEND_ORIGIN_ID, 
+          // low TTLs so that the cache is busted relatively quickly
           minTtl: 0,
           defaultTtl: 10,
           maxTtl: 50,
           viewerProtocolPolicy: "redirect-to-https",
+          // currently our backend needs none of this, but it could potentially use any of these now
           forwardedValues: [
             {
               queryString: true,
@@ -661,10 +680,11 @@ class MyStack extends TerraformStack {
       ],
       defaultRootObject: "index.html",
       restrictions: [{ geoRestriction: [{ restrictionType: "none" }] }],
-      viewerCertificate: [{ cloudfrontDefaultCertificate: true }],
+      viewerCertificate: [{ cloudfrontDefaultCertificate: true }], // we use the default SSL Certificate
     });
 
-    new TerraformOutput(this, "lb-dns", {
+    // Prints the domain name that serves our application
+    new TerraformOutput(this, "domainName", {
       value: cdn.domainName,
     });
   }

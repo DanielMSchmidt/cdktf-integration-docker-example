@@ -433,4 +433,509 @@ leverage all the knowledge that went into creating this module and get our Postg
 
 To deploy the ECS Task we first need to have a docker image pushed. It's up to you if you want to push and deploy it with the CDK or if you want to separate your deployment pipeline from your infrastructure. To me, having everything in one go feels easier and more integrated with the cost that the state gets a bit bigger. So let's see how it can be done within the CDK:
 
-TODO: recopy all examples with classes / scope was changed to this
+```ts
+function PushedECRImage(scope: Construct, name: string, projectPath: string) {
+  const repo = new EcrRepository(scope, `${name}-ecr`, {
+    name,
+    tags,
+  });
+
+  const auth = new DataAwsEcrAuthorizationToken(scope, `${name}-auth`, {
+    dependsOn: [repo],
+    registryId: repo.registryId,
+  });
+
+  const asset = new TerraformAsset(scope, `${name}-project`, {
+    path: projectPath,
+  });
+
+  const version = require(`${projectPath}/package.json`).version;
+  const tag = `${repo.repositoryUrl}:${version}-${asset.assetHash}`;
+  // Workaround due to https://github.com/kreuzwerker/terraform-provider-docker/issues/189
+  const image = new Resource(scope, `${name}-image-${tag}`, {});
+  image.addOverride(
+    "provisioner.local-exec.command",
+    `
+docker login -u ${auth.userName} -p ${auth.password} ${auth.proxyEndpoint} &&
+docker build -t ${tag} ${asset.path} &&
+docker push ${tag}
+`
+  );
+
+  return { image, tag };
+}
+
+class MyStack extends TerraformStack {
+  constructor(scope: Construct, name: string) {
+    // ...
+    const { image: backendImage, tag: backendTag } = PushedECRImage(
+      this,
+      "backend",
+      path.resolve(__dirname, "../../application/backend")
+    );
+  }
+}
+```
+
+First we ensure we have an ECR Repository to push our docker image into and we get authentication credentials for it.
+By using `TerraformAsset` we transfer the backend into the context of Terraform to run our `docker login`, `docker build`, `docker push` chain to get our image pushed.
+I require the package.json of the project so that our image tag is prefixed with the version of the application.
+
+Now that Database, ECS Cluster, and Image are in place we can run our docker image in ECR:
+
+```ts
+class Cluster extends Resource {
+  public cluster: EcsCluster;
+  // ...
+  public runDockerImage(
+    name: string,
+    tag: string,
+    image: Resource,
+    env: Record<string, string | undefined>
+  ) {
+    // Role that allows us to get the Docker image
+    const executionRole = new IamRole(this, `${name}-execution-role`, {
+      name: `${name}-execution-role`,
+      tags,
+      inlinePolicy: [
+        {
+          name: "allow-ecr-pull",
+          policy: JSON.stringify({
+            Version: "2012-10-17",
+            Statement: [
+              {
+                Effect: "Allow",
+                Action: [
+                  "ecr:GetAuthorizationToken",
+                  "ecr:BatchCheckLayerAvailability",
+                  "ecr:GetDownloadUrlForLayer",
+                  "ecr:BatchGetImage",
+                  "logs:CreateLogStream",
+                  "logs:PutLogEvents",
+                ],
+                Resource: "*",
+              },
+            ],
+          }),
+        },
+      ],
+      assumeRolePolicy: JSON.stringify({
+        Version: "2012-10-17",
+        Statement: [
+          {
+            Action: "sts:AssumeRole",
+            Effect: "Allow",
+            Sid: "",
+            Principal: {
+              Service: "ecs-tasks.amazonaws.com",
+            },
+          },
+        ],
+      }),
+    });
+
+    // Role that allows us to push logs
+    const taskRole = new IamRole(this, `${name}-task-role`, {
+      name: `${name}-task-role`,
+      tags,
+      inlinePolicy: [
+        {
+          name: "allow-logs",
+          policy: JSON.stringify({
+            Version: "2012-10-17",
+            Statement: [
+              {
+                Effect: "Allow",
+                Action: ["logs:CreateLogStream", "logs:PutLogEvents"],
+                Resource: "*",
+              },
+            ],
+          }),
+        },
+      ],
+      assumeRolePolicy: JSON.stringify({
+        Version: "2012-10-17",
+        Statement: [
+          {
+            Action: "sts:AssumeRole",
+            Effect: "Allow",
+            Sid: "",
+            Principal: {
+              Service: "ecs-tasks.amazonaws.com",
+            },
+          },
+        ],
+      }),
+    });
+
+    // Creates a log group for the task
+    const logGroup = new CloudwatchLogGroup(this, `${name}-loggroup`, {
+      name: `${this.cluster.name}/${name}`,
+      retentionInDays: 30,
+      tags,
+    });
+
+    // Creates a task that runs the docker container
+    const task = new EcsTaskDefinition(this, `${name}-task`, {
+      // We want to wait until the image is actually pushed
+      dependsOn: [image],
+      tags,
+      // These values are fixed for the example, we can make them part of our function invocation if we want to change them
+      cpu: "256",
+      memory: "512",
+      requiresCompatibilities: ["FARGATE", "EC2"],
+      networkMode: "awsvpc",
+      executionRoleArn: executionRole.arn,
+      taskRoleArn: taskRole.arn,
+      containerDefinitions: JSON.stringify([
+        {
+          name,
+          image: tag,
+          cpu: 256,
+          memory: 512,
+          environment: Object.entries(env).map(([name, value]) => ({
+            name,
+            value,
+          })),
+          portMappings: [
+            {
+              containerPort: 80,
+              hostPort: 80,
+            },
+          ],
+          logConfiguration: {
+            logDriver: "awslogs",
+            options: {
+              // Defines the log
+              "awslogs-group": logGroup.name,
+              "awslogs-region": REGION,
+              "awslogs-stream-prefix": name,
+            },
+          },
+        },
+      ]),
+      family: "service",
+    });
+
+    return task;
+  }
+}
+}
+
+class MyStack extends TerraformStack {
+  constructor(scope: Construct, name: string) {
+    // ...
+    const task = cluster.runDockerImage("backend", backendTag, backendImage, {
+      PORT: "80",
+      POSTGRES_USER: db.instance.username,
+      POSTGRES_PASSWORD: db.instance.password,
+      POSTGRES_DB: db.instance.name,
+      POSTGRES_HOST: db.instance.dbInstanceAddressOutput,
+      POSTGRES_PORT: db.instance.dbInstancePortOutput,
+    });
+  }
+}
+```
+
+Our call on the `MainStack` hides a lot of the underlying complexity; the interface is fairly simple: we pass in a name, Docker image name with tag, the image resource, and an object representing the environment variables.
+Inside the function we create an execution role (used when the docker container is spawned) that allows our task to pull images from ECR and a task role (used by the running docker container) that allows the task to send logs.
+
+We also create a Log Group in Cloudwatch for this service that automatically deletes logs older than 30 days.
+The ECS Task uses all these resources and assumes some other settings (CPU and Memory are fixed and the port is expected to be 80). As you can see we transform the user-friendly object that defines our environment variables into a list of object with name and value properties that the API requires.
+
+Now that we have a running task we need to expose it on our load balancer:
+
+```ts
+class LoadBalancer extends Resource {
+  lb: Lb;
+  lbl: LbListener;
+  vpc: VPC;
+  cluster: EcsCluster;
+  // ...
+
+  exposeService(
+    name: string,
+    task: EcsTaskDefinition,
+    serviceSecurityGroup: SecurityGroup,
+    path: string
+  ) {
+    // Define Load Balancer target group with a health check on /ready
+    const targetGroup = new LbTargetGroup(this, `${name}-target-group`, {
+      dependsOn: [this.lbl],
+      tags,
+      name: `${name}-target-group`,
+      port: 80,
+      protocol: "HTTP",
+      targetType: "ip",
+      vpcId: this.vpc.vpcIdOutput,
+      healthCheck: [
+        {
+          enabled: true,
+          path: "/ready",
+        },
+      ],
+    });
+
+    // Makes the listener forward requests from subpath to the target group
+    new LbListenerRule(this, `${name}-rule`, {
+      listenerArn: this.lbl.arn,
+      priority: 100,
+      tags,
+      action: [
+        {
+          type: "forward",
+          targetGroupArn: targetGroup.arn,
+        },
+      ],
+
+      condition: [
+        {
+          pathPattern: [{ values: [`${path}*`] }],
+        },
+      ],
+    });
+
+    // Ensure the task is running and wired to the target group, within the right security group
+    const service = new EcsService(this, `${name}-service`, {
+      dependsOn: [this.lbl],
+      tags,
+      name,
+      launchType: "FARGATE",
+      cluster: this.cluster.id,
+      desiredCount: 1,
+      taskDefinition: task.arn,
+      networkConfiguration: [
+        {
+          subnets: [],
+          assignPublicIp: true,
+          securityGroups: [serviceSecurityGroup.id],
+        },
+      ],
+      loadBalancer: [
+        {
+          containerPort: 80,
+          containerName: name,
+          targetGroupArn: targetGroup.arn,
+        },
+      ],
+    });
+
+    // This is necessary due to a shortcoming in our token system to be adressed in
+    // https://github.com/hashicorp/terraform-cdk/issues/651
+    service.addOverride(
+      "network_configuration.0.subnets",
+      this.vpc.publicSubnetsOutput
+    );
+  }
+}
+
+class MyStack extends TerraformStack {
+  constructor(scope: Construct, name: string) {
+    // ...
+    loadBalancer.exposeService("backend", task, serviceSecurityGroup, "/backend");
+  }
+}
+```
+
+In the Stack we define that we want to expose a service named backend with the task and serivce security group we just created and it shall be accessible at `/backend` on the load balancer.
+This is implemented by a `TargetGroup` (defining port and health check), a `LBListenerRule` (forwarding all requests under the path to the `TargetGroup`), and a service that ensure the task is running and wired to the target group, within the right security group.
+
+At this point we have our backend up and running, it's exposed on the load balancer and reachable from the outside.
+To finish up we need to push frontend into the cloud, we will do this by serving a S3 Bucket through a CloudfrontDistribution that acts as a Content Delivery Network (CDN).
+
+```ts
+function PublicS3Bucket(
+  scope: Construct,
+  name: string,
+  absoluteContentPath: string
+) {
+  const { path: contentPath, assetHash: contentHash } = new TerraformAsset(
+    scope,
+    `${name}-frontend`,
+    {
+      path: absoluteContentPath,
+    }
+  );
+
+  const bucket = new S3Bucket(scope, `${name}-bucket`, {
+    bucketPrefix: `${name}-frontend`,
+
+    website: [
+      {
+        indexDocument: "index.html",
+        errorDocument: "index.html",
+      },
+    ],
+    tags: {
+      ...tags,
+      "hc-internet-facing": "true",
+    },
+  });
+
+  // we get all build files synchronously
+  const files = glob("**/*.{json,js,html,png,ico,txt,map,css}", {
+    cwd: absoluteContentPath,
+  });
+
+  files.forEach((f) => {
+    // we construct the local path to the file
+    const filePath = path.join(contentPath, f);
+    new S3BucketObject(scope, `${bucket.id}/${f}/${contentHash}`, {
+      bucket: bucket.id,
+      tags,
+      key: f,
+      source: filePath,
+      contentType: mime(path.extname(f)) || "text/html",
+      etag: `filemd5("${filePath}")`,
+    });
+  });
+
+  new S3BucketPolicy(scope, `${name}-s3-policy`, {
+    bucket: bucket.id,
+    policy: JSON.stringify({
+      Version: "2012-10-17",
+      Id: "PolicyForWebsiteEndpointsPublicContent",
+      Statement: [
+        {
+          Sid: "PublicRead",
+          Effect: "Allow",
+          Principal: "*",
+          Action: ["s3:GetObject"],
+          Resource: [`${bucket.arn}/*`, `${bucket.arn}`],
+        },
+      ],
+    }),
+  });
+
+  return bucket;
+}
+
+class MyStack extends TerraformStack {
+  constructor(scope: Construct, name: string) {
+    // ...
+    const bucket = PublicS3Bucket(
+      this,
+      name,
+      path.resolve(__dirname, "../../application/frontend/build")
+    );
+  }
+}
+```
+
+Similar to the docker push this approach is opinionated, you can find [a different one here](https://github.com/hashicorp/cdktf-integration-serverless-example). In this example we aim to have everything under the control of Terraform,
+so we create the `S3Bucket` and upload all files in the build directory through `S3BucketObject`s. We create a `S3BucketPolicy` that allows everyone to access the content of the `S3Bucket`, effectively making our site public.
+
+The React.js application expects the backend to run under the same URL as the website with the prefix `/backend`. To enable this we need to create a CDN that handles caching and forwarding:
+
+```ts
+class MyStack extends TerraformStack {
+  constructor(scope: Construct, name: string) {
+    // ...
+    const cdn = new CloudfrontDistribution(this, "cf", {
+      comment: `Docker example frontend`,
+      tags,
+      enabled: true,
+      defaultCacheBehavior: [
+        {
+          // Allow every method as we want to also serve the backend through this
+          allowedMethods: [
+            "DELETE",
+            "GET",
+            "HEAD",
+            "OPTIONS",
+            "PATCH",
+            "POST",
+            "PUT",
+          ],
+          cachedMethods: ["GET", "HEAD"],
+          targetOriginId: S3_ORIGIN_ID,
+          viewerProtocolPolicy: "redirect-to-https", // ensure we serve https
+          forwardedValues: [
+            { queryString: false, cookies: [{ forward: "none" }] },
+          ],
+        },
+      ],
+      // origins describe different entities that can serve traffic
+      origin: [
+        {
+          originId: S3_ORIGIN_ID, // origin ids can be freely chosen
+          domainName: bucket.websiteEndpoint, // we serve the website hosted by S3 here
+          customOriginConfig: [
+            {
+              originProtocolPolicy: "http-only", // the CDN terminates the SSL connection, we can use http internally
+              httpPort: 80,
+              httpsPort: 443,
+              originSslProtocols: ["TLSv1.2", "TLSv1.1", "TLSv1"],
+            },
+          ],
+        },
+        {
+          originId: BACKEND_ORIGIN_ID,
+          domainName: loadBalancer.lb.dnsName, // our backend is served by the load balancer
+          customOriginConfig: [
+            {
+              originProtocolPolicy: "http-only",
+              httpPort: 80,
+              httpsPort: 443,
+              originSslProtocols: ["TLSv1.2", "TLSv1.1", "TLSv1"],
+            },
+          ],
+        },
+      ],
+      // We define everything that should not be served by the default here
+      orderedCacheBehavior: [
+        {
+          allowedMethods: [
+            "HEAD",
+            "DELETE",
+            "POST",
+            "GET",
+            "OPTIONS",
+            "PUT",
+            "PATCH",
+          ],
+          cachedMethods: ["HEAD", "GET"],
+          pathPattern: "/backend/*", // our backend should be served under /backend
+          targetOriginId: BACKEND_ORIGIN_ID,
+          // low TTLs so that the cache is busted relatively quickly
+          minTtl: 0,
+          defaultTtl: 10,
+          maxTtl: 50,
+          viewerProtocolPolicy: "redirect-to-https",
+          // currently our backend needs none of this, but it could potentially use any of these now
+          forwardedValues: [
+            {
+              queryString: true,
+              headers: ["*"],
+              cookies: [
+                {
+                  forward: "all",
+                },
+              ],
+            },
+          ],
+        },
+      ],
+      defaultRootObject: "index.html",
+      restrictions: [{ geoRestriction: [{ restrictionType: "none" }] }],
+      viewerCertificate: [{ cloudfrontDefaultCertificate: true }], // we use the default SSL Certificate
+    });
+  }
+}
+```
+
+We configure the `CloudfrontDistribution` so that it serves our traffic via https, by default sends requests to the S3 bucket, and routes every request under `/backend` towards our backend service.
+
+With this in place we output our DNS name to visit our fully working site.
+
+```ts
+class MyStack extends TerraformStack {
+  constructor(scope: Construct, name: string) {
+    // ...
+    // Prints the domain name that serves our application
+    new TerraformOutput(this, "domainName", {
+      value: cdn.domainName,
+    });
+  }
+}
+```
