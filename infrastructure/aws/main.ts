@@ -510,6 +510,7 @@ class MyStack extends TerraformStack {
   constructor(scope: Construct, name: string) {
     super(scope, name);
 
+    // We need to instanciate all providers we are going to use
     new AwsProvider(this, "aws", {
       region: REGION,
     });
@@ -517,15 +518,20 @@ class MyStack extends TerraformStack {
     new NullProvider(this, "provider", {});
 
     const vpc = new VPC(this, "vpc", {
+      // We use the name of the stack
       name,
+      // We tag every resource with the same set of tags to easily identify the resources
       tags,
       cidr: "10.0.0.0/16",
+      // We want to run on three availability zones
       azs: ["a", "b", "c"].map((i) => `${REGION}${i}`),
+      // We need three CIDR blocks as we have three availability zones
       privateSubnets: ["10.0.1.0/24", "10.0.2.0/24", "10.0.3.0/24"],
       publicSubnets: ["10.0.101.0/24", "10.0.102.0/24", "10.0.103.0/24"],
       databaseSubnets: ["10.0.201.0/24", "10.0.202.0/24", "10.0.203.0/24"],
       createDatabaseSubnetGroup: true,
       enableNatGateway: true,
+      // Using a single NAT Gateway will save us some money, coming with the cost of less redundancy
       singleNatGateway: true,
     });
 
@@ -585,7 +591,12 @@ class MyStack extends TerraformStack {
       POSTGRES_HOST: db.instance.dbInstanceAddressOutput,
       POSTGRES_PORT: db.instance.dbInstancePortOutput,
     });
-    loadBalancer.exposeService("backend", task, serviceSecurityGroup, "/backend");
+    loadBalancer.exposeService(
+      "backend",
+      task,
+      serviceSecurityGroup,
+      "/backend"
+    );
 
     const bucket = PublicS3Bucket(
       this,
@@ -658,7 +669,7 @@ class MyStack extends TerraformStack {
           ],
           cachedMethods: ["HEAD", "GET"],
           pathPattern: "/backend/*", // our backend should be served under /backend
-          targetOriginId: BACKEND_ORIGIN_ID, 
+          targetOriginId: BACKEND_ORIGIN_ID,
           // low TTLs so that the cache is busted relatively quickly
           minTtl: 0,
           defaultTtl: 10,

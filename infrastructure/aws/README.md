@@ -15,7 +15,7 @@ class MyStack extends TerraformStack {
 
     // We need to instanciate all providers we are going to use
     new AwsProvider(this, "aws", {
-      region,
+      region: REGION,
     });
     new DockerProvider(this, "docker");
     new NullProvider(this, "provider", {});
@@ -27,7 +27,7 @@ class MyStack extends TerraformStack {
       tags,
       cidr: "10.0.0.0/16",
       // We want to run on three availability zones
-      azs: ["a", "b", "c"].map((i) => `${region}${i}`),
+      azs: ["a", "b", "c"].map((i) => `${REGION}${i}`),
       // We need three CIDR blocks as we have three availability zones
       privateSubnets: ["10.0.1.0/24", "10.0.2.0/24", "10.0.3.0/24"],
       publicSubnets: ["10.0.101.0/24", "10.0.102.0/24", "10.0.103.0/24"],
@@ -58,138 +58,14 @@ function Cluster(scope: Construct, name: string) {
 
   return {
     cluster,
-    // We expose this function to run our task later on
+    // we will discuss this later on
     runDockerImage(
       name: string,
       tag: string,
       image: Resource,
       env: Record<string, string | undefined>
     ) {
-      // Role that allows us to get the Docker image
-      const executionRole = new IamRole(scope, `${name}-execution-role`, {
-        name: `${name}-execution-role`,
-        tags,
-        inlinePolicy: [
-          {
-            name: "allow-ecr-pull",
-            policy: JSON.stringify({
-              Version: "2012-10-17",
-              Statement: [
-                {
-                  Effect: "Allow",
-                  Action: [
-                    "ecr:GetAuthorizationToken",
-                    "ecr:BatchCheckLayerAvailability",
-                    "ecr:GetDownloadUrlForLayer",
-                    "ecr:BatchGetImage",
-                    "logs:CreateLogStream",
-                    "logs:PutLogEvents",
-                  ],
-                  Resource: "*",
-                },
-              ],
-            }),
-          },
-        ],
-        assumeRolePolicy: JSON.stringify({
-          Version: "2012-10-17",
-          Statement: [
-            {
-              Action: "sts:AssumeRole",
-              Effect: "Allow",
-              Sid: "",
-              Principal: {
-                Service: "ecs-tasks.amazonaws.com",
-              },
-            },
-          ],
-        }),
-      });
-
-      // Role that allows us to push logs
-      const taskRole = new IamRole(scope, `${name}-task-role`, {
-        name: `${name}-task-role`,
-        tags,
-        inlinePolicy: [
-          {
-            name: "allow-logs",
-            policy: JSON.stringify({
-              Version: "2012-10-17",
-              Statement: [
-                {
-                  Effect: "Allow",
-                  Action: ["logs:CreateLogStream", "logs:PutLogEvents"],
-                  Resource: "*",
-                },
-              ],
-            }),
-          },
-        ],
-        assumeRolePolicy: JSON.stringify({
-          Version: "2012-10-17",
-          Statement: [
-            {
-              Action: "sts:AssumeRole",
-              Effect: "Allow",
-              Sid: "",
-              Principal: {
-                Service: "ecs-tasks.amazonaws.com",
-              },
-            },
-          ],
-        }),
-      });
-
-      // Creates a log group for the task
-      const logGroup = new CloudwatchLogGroup(scope, `${name}-loggroup`, {
-        name: `${cluster.name}/${name}`,
-        retentionInDays: 30,
-        tags,
-      });
-
-      // Creates a task that runs the docker container
-      const task = new EcsTaskDefinition(scope, `${name}-task`, {
-        // We want to wait until the image is actually pushed
-        dependsOn: [image],
-        tags,
-        // These values are fixed for the example, we can make them part of our function invocation if we want to change them
-        cpu: "256",
-        memory: "512",
-        requiresCompatibilities: ["FARGATE", "EC2"],
-        networkMode: "awsvpc",
-        executionRoleArn: executionRole.arn,
-        taskRoleArn: taskRole.arn,
-        containerDefinitions: JSON.stringify([
-          {
-            name,
-            image: tag,
-            cpu: 256,
-            memory: 512,
-            environment: Object.entries(env).map(([name, value]) => ({
-              name,
-              value,
-            })),
-            portMappings: [
-              {
-                containerPort: 80,
-                hostPort: 80,
-              },
-            ],
-            logConfiguration: {
-              logDriver: "awslogs",
-              options: {
-                // Defines the log group and prefix
-                "awslogs-group": logGroup.name,
-                "awslogs-region": REGION,
-                "awslogs-stream-prefix": name,
-              },
-            },
-          },
-        ]),
-        family: "service",
-      });
-
-      return task;
+      // ...
     },
   };
 }
@@ -519,6 +395,7 @@ class Cluster extends Resource {
           }),
         },
       ],
+      // this role shall only be used by an ECS task
       assumeRolePolicy: JSON.stringify({
         Version: "2012-10-17",
         Statement: [
@@ -619,7 +496,6 @@ class Cluster extends Resource {
 
     return task;
   }
-}
 }
 
 class MyStack extends TerraformStack {
@@ -732,7 +608,12 @@ class LoadBalancer extends Resource {
 class MyStack extends TerraformStack {
   constructor(scope: Construct, name: string) {
     // ...
-    loadBalancer.exposeService("backend", task, serviceSecurityGroup, "/backend");
+    loadBalancer.exposeService(
+      "backend",
+      task,
+      serviceSecurityGroup,
+      "/backend"
+    );
   }
 }
 ```
@@ -749,6 +630,7 @@ function PublicS3Bucket(
   name: string,
   absoluteContentPath: string
 ) {
+  // Get built frontend into the terraform context
   const { path: contentPath, assetHash: contentHash } = new TerraformAsset(
     scope,
     `${name}-frontend`,
@@ -757,44 +639,49 @@ function PublicS3Bucket(
     }
   );
 
+  // create bucket with website delivery enabled
   const bucket = new S3Bucket(scope, `${name}-bucket`, {
     bucketPrefix: `${name}-frontend`,
 
     website: [
       {
         indexDocument: "index.html",
-        errorDocument: "index.html",
+        errorDocument: "index.html", // we could put a static error page here
       },
     ],
     tags: {
       ...tags,
-      "hc-internet-facing": "true",
+      "hc-internet-facing": "true", // this is only needed for HashiCorp internal security auditing
     },
   });
 
-  // we get all build files synchronously
+  // Get all build files synchronously
   const files = glob("**/*.{json,js,html,png,ico,txt,map,css}", {
     cwd: absoluteContentPath,
   });
 
   files.forEach((f) => {
-    // we construct the local path to the file
+    // Construct the local path to the file
     const filePath = path.join(contentPath, f);
+
+    // Creates all the files in the bucket
     new S3BucketObject(scope, `${bucket.id}/${f}/${contentHash}`, {
       bucket: bucket.id,
       tags,
       key: f,
       source: filePath,
+      // mime is an open source node.js tool to get mime types per extension
       contentType: mime(path.extname(f)) || "text/html",
       etag: `filemd5("${filePath}")`,
     });
   });
 
+  // allow read access to all elements within the S3Bucket
   new S3BucketPolicy(scope, `${name}-s3-policy`, {
     bucket: bucket.id,
     policy: JSON.stringify({
       Version: "2012-10-17",
-      Id: "PolicyForWebsiteEndpointsPublicContent",
+      Id: `${name}-public-website`,
       Statement: [
         {
           Sid: "PublicRead",
