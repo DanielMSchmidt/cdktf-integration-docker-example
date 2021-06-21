@@ -1,7 +1,9 @@
-# AWS Docker Integration Example
+# Run Docker Container on AWS ECS with Terraform CDK using Typescript
 
 Did you ever wanted to get a backend service in a Docker container with a static (e.g. React) frontend running on AWS?
 In this example we are going to walk you through how to set everything up in AWS and how to configure the backend to run against a Postgres Database, all using the CDK for Terraform.
+
+You can find the application under [`./application`](./application) in this repository.
 
 First of all we start with `cdktf init --template typescript` to get our project setup started. This gives us a `main.ts` file as entrypoint for our infrastructure definition. To start we first need to configure a Virtual Private Cloud (VPC) to host all of our resources in, most services need to have an association with a VPC.
 
