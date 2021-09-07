@@ -6,3 +6,6 @@ cdktf.log
 *terraform.*.tfstate*
 .gen
 .terraform
+!setup.js
+!jest.config.js
+!__tests__/fixtures/foo.js

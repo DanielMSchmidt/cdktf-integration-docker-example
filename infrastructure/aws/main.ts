@@ -38,7 +38,11 @@ const tags = {
   owner: "dschmidt",
 };
 
-function PushedECRImage(scope: Construct, name: string, projectPath: string) {
+export function PushedECRImage(
+  scope: Construct,
+  name: string,
+  projectPath: string
+) {
   const repo = new EcrRepository(scope, `${name}-ecr`, {
     name,
     tags,
@@ -69,7 +73,7 @@ docker push ${tag}
   return { image, tag };
 }
 
-class PostgresDB extends Resource {
+export class PostgresDB extends Resource {
   public instance: TerraformAwsModulesRdsAws;
 
   constructor(
@@ -135,7 +139,7 @@ class PostgresDB extends Resource {
   }
 }
 
-class Cluster extends Resource {
+export class Cluster extends Resource {
   public cluster: EcsCluster;
   constructor(scope: Construct, clusterName: string) {
     super(scope, clusterName);
@@ -433,7 +437,7 @@ class LoadBalancer extends Resource {
   }
 }
 
-function PublicS3Bucket(
+export function PublicS3Bucket(
   scope: Construct,
   name: string,
   absoluteContentPath: string
