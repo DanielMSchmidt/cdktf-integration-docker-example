@@ -2,3 +2,5 @@ application/backend/node_modules/
 .env
 .vscode
 .DS_Store
+node_modules/
+yarn.lock
